@@ -37,8 +37,20 @@
 
 #define	MAX_BUFS	8
 
+/*
+ * Overrides for working out an import that does not look right.  The values
+ * bhyve reports come from virglrenderer, and they have already proved not to
+ * match what the guest compositor actually allocated, so being able to try a
+ * different fourcc or modifier without rebuilding is worth the few lines.
+ */
+static uint32_t	opt_fourcc;		/* 0 = use what bhyve reports */
+static uint64_t	opt_modifier;
+static bool	opt_modifier_set;
+static int32_t	opt_offset = -1;	/* <0 = use what bhyve reports */
+
 struct buf {
 	uint32_t	id;
+	uint32_t	fourcc;
 	bool		used;
 	struct wl_buffer *wlbuf;
 	uint32_t	width, height;
@@ -205,10 +217,23 @@ handle_scanout(struct view *v, const struct gpu_display_scanout *so, int fd)
 	v->cur_w = so->width;
 	v->cur_h = so->height;
 
-	params = zwp_linux_dmabuf_v1_create_params(v->dmabuf);
-	zwp_linux_buffer_params_v1_add(params, fd, 0 /* plane */, 0 /* offset */,
-	    so->stride, (uint32_t)(so->modifier >> 32),
-	    (uint32_t)(so->modifier & 0xffffffff));
+	{
+		uint32_t fourcc = opt_fourcc ? opt_fourcc : so->drm_fourcc;
+		uint64_t mod = opt_modifier_set ? opt_modifier : so->modifier;
+		uint32_t off = opt_offset >= 0 ? (uint32_t)opt_offset :
+		    so->offset;
+
+		fprintf(stderr, "bhyve-viewer: import %ux%u fourcc=0x%08x "
+		    "stride=%u offset=%u modifier=0x%016llx\n", so->width,
+		    so->height, fourcc, so->stride, off,
+		    (unsigned long long)mod);
+
+		params = zwp_linux_dmabuf_v1_create_params(v->dmabuf);
+		zwp_linux_buffer_params_v1_add(params, fd, 0 /* plane */, off,
+		    so->stride, (uint32_t)(mod >> 32),
+		    (uint32_t)(mod & 0xffffffff));
+		b->fourcc = fourcc;
+	}
 	zwp_linux_buffer_params_v1_add_listener(params, &params_listener, b);
 	/*
 	 * create_immed() would avoid a round trip, but it kills the client on
@@ -217,7 +242,7 @@ handle_scanout(struct view *v, const struct gpu_display_scanout *so, int fd)
 	 * print a diagnostic.
 	 */
 	zwp_linux_buffer_params_v1_create(params, so->width, so->height,
-	    so->drm_fourcc, 0 /* flags */);
+	    b->fourcc, 0 /* flags */);
 
 	close(fd);	/* the compositor dup'd it */
 }
@@ -573,8 +598,42 @@ main(int argc, char **argv)
 	struct view v;
 	struct pollfd pfd[2];
 
-	if (argc != 2) {
-		fprintf(stderr, "usage: bhyve-viewer <socket-path>\n");
+	{
+		int c;
+
+		while ((c = getopt(argc, argv, "f:m:o:")) != -1) {
+			switch (c) {
+			case 'f':	/* e.g. -f XR24 */
+				if (strlen(optarg) == 4)
+					opt_fourcc = (uint32_t)optarg[0] |
+					    ((uint32_t)optarg[1] << 8) |
+					    ((uint32_t)optarg[2] << 16) |
+					    ((uint32_t)optarg[3] << 24);
+				else
+					opt_fourcc = (uint32_t)strtoul(optarg,
+					    NULL, 0);
+				break;
+			case 'm':
+				opt_modifier = strtoull(optarg, NULL, 0);
+				opt_modifier_set = true;
+				break;
+			case 'o':
+				opt_offset = (int32_t)strtol(optarg, NULL, 0);
+				break;
+			default:
+				goto usage;
+			}
+		}
+		argc -= optind;
+		argv += optind;
+	}
+	if (argc != 1) {
+usage:
+		fprintf(stderr, "usage: bhyve-viewer [-f fourcc] "
+		    "[-m modifier] [-o offset] <socket-path>\n"
+		    "  -f  four character code, e.g. XR24, or a number\n"
+		    "  -m  DRM format modifier, e.g. 0 for linear\n"
+		    "  -o  byte offset of plane 0 in the dma_buf\n");
 		return (1);
 	}
 
@@ -583,10 +642,10 @@ main(int argc, char **argv)
 	v.win_w = 1920;
 	v.win_h = 1080;
 
-	v.sock = connect_socket(argv[1]);
+	v.sock = connect_socket(argv[0]);
 	if (v.sock < 0) {
 		fprintf(stderr, "bhyve-viewer: cannot connect to %s: %s\n",
-		    argv[1], strerror(errno));
+		    argv[0], strerror(errno));
 		return (1);
 	}
 
