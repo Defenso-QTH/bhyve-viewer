@@ -36,7 +36,12 @@ linux-dmabuf-v1-protocol.c:
 	${WAYLAND_SCANNER} private-code \
 	    ${WAYLAND_PROTOCOLS}/stable/linux-dmabuf/linux-dmabuf-v1.xml $@
 
-main.o: xdg-shell-client-protocol.h linux-dmabuf-v1-client-protocol.h
+# Name every object variant: bsd.prog.mk builds main.pieo under a PIE build
+# (which the ports framework uses), main.po when profiling, and main.o
+# otherwise.  Depending on main.o alone silently does nothing in the two
+# cases that matter.
+main.o main.pieo main.po: xdg-shell-client-protocol.h \
+	linux-dmabuf-v1-client-protocol.h
 
 CLEANFILES+=	xdg-shell-client-protocol.h xdg-shell-protocol.c \
 		linux-dmabuf-v1-client-protocol.h linux-dmabuf-v1-protocol.c
