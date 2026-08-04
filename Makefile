@@ -4,7 +4,7 @@
 # XML from wayland-protocols, both found through pkg-config.
 
 PROG=	bhyve-viewer
-SRCS=	main.c xdg-shell-protocol.c linux-dmabuf-v1-protocol.c
+SRCS=	main.c xdg-shell-protocol.c
 MAN=
 
 BINDIR?=	/usr/local/bin
@@ -13,8 +13,9 @@ WAYLAND_PROTOCOLS!=	pkg-config --variable=pkgdatadir wayland-protocols
 WAYLAND_SCANNER!=	pkg-config --variable=wayland_scanner wayland-scanner
 
 CFLAGS+=	-I${.CURDIR}/src -I${.OBJDIR} -Wall -Wextra
-CFLAGS+=	`pkg-config --cflags wayland-client`
-LDADD+=		`pkg-config --libs wayland-client`
+PKGS=		wayland-client wayland-egl egl glesv2
+CFLAGS+=	`pkg-config --cflags ${PKGS}`
+LDADD+=		`pkg-config --libs ${PKGS}`
 
 .PATH: ${.CURDIR}/src
 
@@ -28,22 +29,12 @@ xdg-shell-protocol.c:
 	${WAYLAND_SCANNER} private-code \
 	    ${WAYLAND_PROTOCOLS}/stable/xdg-shell/xdg-shell.xml $@
 
-linux-dmabuf-v1-client-protocol.h:
-	${WAYLAND_SCANNER} client-header \
-	    ${WAYLAND_PROTOCOLS}/stable/linux-dmabuf/linux-dmabuf-v1.xml $@
-
-linux-dmabuf-v1-protocol.c:
-	${WAYLAND_SCANNER} private-code \
-	    ${WAYLAND_PROTOCOLS}/stable/linux-dmabuf/linux-dmabuf-v1.xml $@
-
 # Name every object variant: bsd.prog.mk builds main.pieo under a PIE build
 # (which the ports framework uses), main.po when profiling, and main.o
 # otherwise.  Depending on main.o alone silently does nothing in the two
 # cases that matter.
-main.o main.pieo main.po: xdg-shell-client-protocol.h \
-	linux-dmabuf-v1-client-protocol.h
+main.o main.pieo main.po: xdg-shell-client-protocol.h
 
-CLEANFILES+=	xdg-shell-client-protocol.h xdg-shell-protocol.c \
-		linux-dmabuf-v1-client-protocol.h linux-dmabuf-v1-protocol.c
+CLEANFILES+=	xdg-shell-client-protocol.h xdg-shell-protocol.c
 
 .include <bsd.prog.mk>

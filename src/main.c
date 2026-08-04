@@ -9,12 +9,25 @@
  *
  * The guest already renders on the host GPU -- with venus its images never
  * leave host GPU memory -- so bhyve exports the scanout as a dma_buf and
- * passes the fd over a unix socket.  This imports it with zwp_linux_dmabuf_v1
- * and hands it to the host compositor.  Nothing is read back, encoded or
- * compressed anywhere in that path.
+ * passes the fd over a unix socket.
  *
- * Keeping this out of bhyve is deliberate: the VMM stays free of Wayland and
- * EGL, and this can be jailed with nothing but the socket.
+ * The buffer is imported through EGL (EGL_LINUX_DMA_BUF_EXT) and drawn to an
+ * ordinary Wayland surface, rather than handed to the compositor as a
+ * linux-dmabuf wl_buffer.  That is deliberate.  Handing it over directly
+ * requires telling the compositor the buffer's format modifier, and
+ * virglrenderer does not report one: resource_get_info_ext() returns
+ * DRM_FORMAT_MOD_INVALID whatever the guest allocates.  Asserting a layout we
+ * do not know produced periodic corruption -- the compositor reading tiled or
+ * DCC-compressed memory as raw pixels -- and no guessed value fixed it,
+ * because the information was never available to guess from.
+ *
+ * Importing through EGL sidesteps the question: Mesa allocated these buffers
+ * and Mesa reads them back, on the same GPU with the same driver, so the
+ * implicit layout is known to both ends.  The cost is one GPU-to-GPU blit per
+ * frame instead of a direct handover -- still no CPU copy and no encode.
+ *
+ * Keeping this out of bhyve is deliberate too: the VMM stays free of EGL and
+ * Wayland, and this can be jailed with nothing but the socket.
  */
 
 #include <sys/socket.h>
@@ -29,58 +42,74 @@
 #include <unistd.h>
 
 #include <wayland-client.h>
+#include <wayland-egl.h>
+
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 
 #include "gpu_display.h"
 #include "keymap.h"
 #include "xdg-shell-client-protocol.h"
-#include "linux-dmabuf-v1-client-protocol.h"
 
 #define	MAX_BUFS	8
 
 /*
- * Overrides for working out an import that does not look right.  The values
- * bhyve reports come from virglrenderer, and they have already proved not to
- * match what the guest compositor actually allocated, so being able to try a
- * different fourcc or modifier without rebuilding is worth the few lines.
+ * Overrides kept from the linux-dmabuf implementation this replaced: the
+ * values bhyve reports proved unreliable, and being able to try another
+ * without a rebuild saved several cycles.  The modifier override is gone --
+ * with an implicit EGL import there is no modifier to override.
  */
-static uint32_t	opt_fourcc;		/* 0 = use what bhyve reports */
-static uint64_t	opt_modifier;
-static bool	opt_modifier_set;
-static int32_t	opt_offset = -1;	/* <0 = use what bhyve reports */
+static uint32_t	opt_fourcc;
+static int32_t	opt_offset = -1;
+static bool	opt_flip;
 
 struct buf {
 	uint32_t	id;
-	uint32_t	fourcc;
 	bool		used;
-	struct wl_buffer *wlbuf;
+	EGLImageKHR	image;
+	GLuint		tex;
 	uint32_t	width, height;
 };
 
 struct view {
-	/* bhyve side */
 	int		sock;
 	uint8_t		inbuf[GPU_DISPLAY_MAX_MSG];
 	size_t		inlen;
 
-	/* wayland side */
 	struct wl_display	*dpy;
 	struct wl_registry	*registry;
 	struct wl_compositor	*compositor;
 	struct xdg_wm_base	*wm_base;
-	struct zwp_linux_dmabuf_v1 *dmabuf;
 	struct wl_seat		*seat;
 	struct wl_keyboard	*kbd;
 	struct wl_pointer	*ptr;
 	struct wl_surface	*surface;
 	struct xdg_surface	*xsurface;
 	struct xdg_toplevel	*toplevel;
+	struct wl_egl_window	*egl_window;
+
+	EGLDisplay	egl_dpy;
+	EGLContext	egl_ctx;
+	EGLSurface	egl_surf;
+	EGLConfig	egl_cfg;
+
+	GLuint		prog;
+	GLint		attr_pos;
+	GLint		uni_tex;
+	GLint		uni_flip;
 
 	struct buf	bufs[MAX_BUFS];
-	uint32_t	cur_w, cur_h;	/* guest resolution, for pointer scaling */
-	int32_t		win_w, win_h;	/* our window size, for pointer scaling */
+	uint32_t	cur_w, cur_h;
+	int32_t		win_w, win_h;
 	bool		configured;
 	bool		running;
 };
+
+static PFNEGLCREATEIMAGEKHRPROC		p_eglCreateImageKHR;
+static PFNEGLDESTROYIMAGEKHRPROC	p_eglDestroyImageKHR;
+static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC p_glEGLImageTargetTexture2DOES;
 
 /* ------------------------------------------------------------------ */
 /* bhyve socket							      */
@@ -100,8 +129,7 @@ send_key(struct view *v, uint32_t evdev, bool down)
 	uint32_t xt = evdev_to_xt(evdev);
 
 	if (xt == 0)
-		return;		/* unmapped; bhyve's keysym path can't help here */
-
+		return;
 	memset(&k, 0, sizeof(k));
 	k.hdr.type = GPU_DISPLAY_MSG_KEY;
 	k.hdr.len = sizeof(k);
@@ -120,10 +148,9 @@ send_ptr(struct view *v, uint32_t buttons, int32_t x, int32_t y)
 	p.hdr.len = sizeof(p);
 	p.button = buttons;
 	/*
-	 * The guest's tablet is absolute in guest pixels, so scale from the
-	 * window rather than forwarding raw surface coordinates -- otherwise
-	 * the pointer drifts as soon as the window is not exactly the guest
-	 * resolution.
+	 * The guest tablet is absolute in guest pixels, so scale from the
+	 * window rather than forwarding surface coordinates -- otherwise the
+	 * pointer drifts whenever the window is not the guest resolution.
 	 */
 	if (v->win_w > 0 && v->win_h > 0 && v->cur_w && v->cur_h) {
 		p.x = (int32_t)((int64_t)x * v->cur_w / v->win_w);
@@ -133,6 +160,98 @@ send_ptr(struct view *v, uint32_t buttons, int32_t x, int32_t y)
 		p.y = y;
 	}
 	(void)send_msg(v, &p, sizeof(p));
+}
+
+/* ------------------------------------------------------------------ */
+/* GL								      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A dma_buf imported through EGL is sampled with samplerExternalOES, not
+ * sampler2D.  The external target is what lets the driver apply whatever
+ * tiling or compression the buffer actually carries, which is the entire
+ * reason this path works where naming a modifier did not.
+ */
+static const char *vert_src =
+"attribute vec2 pos;\n"
+"varying vec2 uv;\n"
+"uniform float flip;\n"
+"void main() {\n"
+"  uv = vec2((pos.x + 1.0) * 0.5, (1.0 - flip * pos.y) * 0.5);\n"
+"  gl_Position = vec4(pos, 0.0, 1.0);\n"
+"}\n";
+
+static const char *frag_src =
+"#extension GL_OES_EGL_image_external : require\n"
+"precision mediump float;\n"
+"varying vec2 uv;\n"
+"uniform samplerExternalOES tex;\n"
+"void main() { gl_FragColor = texture2D(tex, uv); }\n";
+
+static GLuint
+compile(GLenum type, const char *src)
+{
+	GLuint s = glCreateShader(type);
+	GLint ok = 0;
+
+	glShaderSource(s, 1, &src, NULL);
+	glCompileShader(s);
+	glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+	if (!ok) {
+		char log[512];
+
+		glGetShaderInfoLog(s, sizeof(log), NULL, log);
+		fprintf(stderr, "bhyve-viewer: shader: %s\n", log);
+		return (0);
+	}
+	return (s);
+}
+
+static bool
+gl_setup(struct view *v)
+{
+	GLuint vs = compile(GL_VERTEX_SHADER, vert_src);
+	GLuint fs = compile(GL_FRAGMENT_SHADER, frag_src);
+	GLint ok = 0;
+
+	if (vs == 0 || fs == 0)
+		return (false);
+	v->prog = glCreateProgram();
+	glAttachShader(v->prog, vs);
+	glAttachShader(v->prog, fs);
+	glLinkProgram(v->prog);
+	glGetProgramiv(v->prog, GL_LINK_STATUS, &ok);
+	if (!ok) {
+		char log[512];
+
+		glGetProgramInfoLog(v->prog, sizeof(log), NULL, log);
+		fprintf(stderr, "bhyve-viewer: link: %s\n", log);
+		return (false);
+	}
+	v->attr_pos = glGetAttribLocation(v->prog, "pos");
+	v->uni_tex = glGetUniformLocation(v->prog, "tex");
+	v->uni_flip = glGetUniformLocation(v->prog, "flip");
+	return (true);
+}
+
+static void
+draw(struct view *v, struct buf *b)
+{
+	static const GLfloat quad[] = {
+		-1.f, -1.f,  1.f, -1.f, -1.f, 1.f,
+		 1.f, -1.f,  1.f,  1.f, -1.f, 1.f,
+	};
+
+	glViewport(0, 0, v->win_w, v->win_h);
+	glUseProgram(v->prog);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_EXTERNAL_OES, b->tex);
+	glUniform1i(v->uni_tex, 0);
+	glUniform1f(v->uni_flip, opt_flip ? -1.f : 1.f);
+	glVertexAttribPointer(v->attr_pos, 2, GL_FLOAT, GL_FALSE, 0, quad);
+	glEnableVertexAttribArray(v->attr_pos);
+	glDrawArrays(GL_TRIANGLES, 0, 6);
+	eglSwapBuffers(v->egl_dpy, v->egl_surf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -150,37 +269,38 @@ buf_find(struct view *v, uint32_t id)
 }
 
 static void
-dmabuf_created(void *data, struct zwp_linux_buffer_params_v1 *params,
-    struct wl_buffer *wlbuf)
+buf_release(struct view *v, struct buf *b)
 {
-	struct buf *b = data;
 
-	b->wlbuf = wlbuf;
-	zwp_linux_buffer_params_v1_destroy(params);
+	if (b->image != EGL_NO_IMAGE_KHR && b->image != NULL)
+		p_eglDestroyImageKHR(v->egl_dpy, b->image);
+	if (b->tex != 0)
+		glDeleteTextures(1, &b->tex);
+	memset(b, 0, sizeof(*b));
 }
-
-static void
-dmabuf_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
-{
-	struct buf *b = data;
-
-	fprintf(stderr, "bhyve-viewer: compositor rejected dma_buf for buffer %u\n",
-	    b->id);
-	b->used = false;
-	zwp_linux_buffer_params_v1_destroy(params);
-}
-
-static const struct zwp_linux_buffer_params_v1_listener params_listener = {
-	.created = dmabuf_created,
-	.failed = dmabuf_failed,
-};
 
 static void
 handle_scanout(struct view *v, const struct gpu_display_scanout *so, int fd)
 {
-	struct zwp_linux_buffer_params_v1 *params;
 	struct buf *b;
+	uint32_t fourcc = opt_fourcc ? opt_fourcc : so->drm_fourcc;
+	uint32_t off = opt_offset >= 0 ? (uint32_t)opt_offset : so->offset;
 	int slot = -1;
+	EGLint attrs[] = {
+		EGL_WIDTH,			(EGLint)so->width,
+		EGL_HEIGHT,			(EGLint)so->height,
+		EGL_LINUX_DRM_FOURCC_EXT,	(EGLint)fourcc,
+		EGL_DMA_BUF_PLANE0_FD_EXT,	fd,
+		EGL_DMA_BUF_PLANE0_OFFSET_EXT,	(EGLint)off,
+		EGL_DMA_BUF_PLANE0_PITCH_EXT,	(EGLint)so->stride,
+		EGL_NONE
+		/*
+		 * Deliberately no EGL_DMA_BUF_PLANE0_MODIFIER_*_EXT.  Omitting
+		 * them requests an implicit-modifier import: Mesa allocated
+		 * this buffer and knows its layout, and not having to name one
+		 * is the whole point of this path.
+		 */
+	};
 
 	if (fd < 0) {
 		fprintf(stderr, "bhyve-viewer: scanout %u arrived with no fd\n",
@@ -188,27 +308,52 @@ handle_scanout(struct view *v, const struct gpu_display_scanout *so, int fd)
 		return;
 	}
 	if (so->transport != GPU_DISPLAY_XPORT_DMABUF) {
-		fprintf(stderr, "bhyve-viewer: transport %u not supported yet\n",
+		fprintf(stderr, "bhyve-viewer: transport %u unsupported\n",
 		    so->transport);
 		close(fd);
 		return;
 	}
 
-	/* Replace the entry for this id, or take a free slot. */
 	b = buf_find(v, so->buffer_id);
 	if (b == NULL) {
 		for (int i = 0; i < MAX_BUFS; i++)
-			if (!v->bufs[i].used) { slot = i; break; }
+			if (!v->bufs[i].used) {
+				slot = i;
+				break;
+			}
 		if (slot < 0) {
 			fprintf(stderr, "bhyve-viewer: out of buffer slots\n");
 			close(fd);
 			return;
 		}
 		b = &v->bufs[slot];
-	} else if (b->wlbuf != NULL) {
-		wl_buffer_destroy(b->wlbuf);
-		b->wlbuf = NULL;
+	} else
+		buf_release(v, b);
+
+	fprintf(stderr, "bhyve-viewer: import %ux%u fourcc=0x%08x stride=%u "
+	    "offset=%u (implicit modifier)\n", so->width, so->height, fourcc,
+	    so->stride, off);
+
+	b->image = p_eglCreateImageKHR(v->egl_dpy, EGL_NO_CONTEXT,
+	    EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+	if (b->image == EGL_NO_IMAGE_KHR) {
+		fprintf(stderr, "bhyve-viewer: eglCreateImageKHR failed "
+		    "(0x%x)\n", eglGetError());
+		close(fd);
+		return;
 	}
+
+	glGenTextures(1, &b->tex);
+	glBindTexture(GL_TEXTURE_EXTERNAL_OES, b->tex);
+	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER,
+	    GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER,
+	    GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S,
+	    GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T,
+	    GL_CLAMP_TO_EDGE);
+	p_glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, b->image);
 
 	b->id = so->buffer_id;
 	b->width = so->width;
@@ -217,34 +362,8 @@ handle_scanout(struct view *v, const struct gpu_display_scanout *so, int fd)
 	v->cur_w = so->width;
 	v->cur_h = so->height;
 
-	{
-		uint32_t fourcc = opt_fourcc ? opt_fourcc : so->drm_fourcc;
-		uint64_t mod = opt_modifier_set ? opt_modifier : so->modifier;
-		uint32_t off = opt_offset >= 0 ? (uint32_t)opt_offset :
-		    so->offset;
-
-		fprintf(stderr, "bhyve-viewer: import %ux%u fourcc=0x%08x "
-		    "stride=%u offset=%u modifier=0x%016llx\n", so->width,
-		    so->height, fourcc, so->stride, off,
-		    (unsigned long long)mod);
-
-		params = zwp_linux_dmabuf_v1_create_params(v->dmabuf);
-		zwp_linux_buffer_params_v1_add(params, fd, 0 /* plane */, off,
-		    so->stride, (uint32_t)(mod >> 32),
-		    (uint32_t)(mod & 0xffffffff));
-		b->fourcc = fourcc;
-	}
-	zwp_linux_buffer_params_v1_add_listener(params, &params_listener, b);
-	/*
-	 * create_immed() would avoid a round trip, but it kills the client on
-	 * an unimportable buffer instead of reporting it.  Given this is the
-	 * first thing anyone will get wrong, take the asynchronous path and
-	 * print a diagnostic.
-	 */
-	zwp_linux_buffer_params_v1_create(params, so->width, so->height,
-	    b->fourcc, 0 /* flags */);
-
-	close(fd);	/* the compositor dup'd it */
+	/* EGL holds its own reference to the underlying buffer. */
+	close(fd);
 }
 
 static void
@@ -252,26 +371,11 @@ handle_frame(struct view *v, const struct gpu_display_frame *f)
 {
 	struct buf *b = buf_find(v, f->buffer_id);
 
-	if (b == NULL || b->wlbuf == NULL)
-		return;		/* not imported (yet); nothing to show */
-	if (!v->configured)
+	if (b == NULL || b->tex == 0 || !v->configured)
 		return;
-
-	wl_surface_attach(v->surface, b->wlbuf, 0, 0);
-	if (f->w != 0 && f->h != 0)
-		wl_surface_damage_buffer(v->surface, (int32_t)f->x,
-		    (int32_t)f->y, (int32_t)f->w, (int32_t)f->h);
-	else
-		wl_surface_damage_buffer(v->surface, 0, 0, (int32_t)b->width,
-		    (int32_t)b->height);
-	wl_surface_commit(v->surface);
+	draw(v, b);
 }
 
-/*
- * Read whatever is available and dispatch every complete message.  fds arrive
- * as ancillary data on the message that needs them, so recvmsg is used rather
- * than read.
- */
 static bool
 sock_readable(struct view *v)
 {
@@ -299,11 +403,10 @@ sock_readable(struct view *v)
 	v->inlen += (size_t)n;
 
 	for (cmsg = CMSG_FIRSTHDR(&mh); cmsg != NULL;
-	    cmsg = CMSG_NXTHDR(&mh, cmsg)) {
+	    cmsg = CMSG_NXTHDR(&mh, cmsg))
 		if (cmsg->cmsg_level == SOL_SOCKET &&
 		    cmsg->cmsg_type == SCM_RIGHTS)
 			memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
-	}
 
 	for (;;) {
 		struct gpu_display_hdr hdr;
@@ -312,7 +415,7 @@ sock_readable(struct view *v)
 			break;
 		memcpy(&hdr, v->inbuf, sizeof(hdr));
 		if (hdr.len < sizeof(hdr) || hdr.len > sizeof(v->inbuf)) {
-			fprintf(stderr, "bhyve-viewer: bad message length %u\n",
+			fprintf(stderr, "bhyve-viewer: bad length %u\n",
 			    hdr.len);
 			return (false);
 		}
@@ -321,39 +424,35 @@ sock_readable(struct view *v)
 
 		switch (hdr.type) {
 		case GPU_DISPLAY_MSG_HELLO: {
-			const struct gpu_display_hello *h = (const void *)v->inbuf;
+			const struct gpu_display_hello *h =
+			    (const void *)v->inbuf;
 
 			if (h->version != GPU_DISPLAY_VERSION)
-				fprintf(stderr, "bhyve-viewer: protocol %u, "
-				    "expected %u -- continuing anyway\n",
-				    h->version, GPU_DISPLAY_VERSION);
+				fprintf(stderr, "bhyve-viewer: protocol %u vs "
+				    "%u\n", h->version, GPU_DISPLAY_VERSION);
 			break;
 		}
 		case GPU_DISPLAY_MSG_SCANOUT:
 			handle_scanout(v, (const void *)v->inbuf, fd);
-			fd = -1;	/* consumed */
+			fd = -1;
 			break;
 		case GPU_DISPLAY_MSG_FRAME:
 			handle_frame(v, (const void *)v->inbuf);
 			break;
 		case GPU_DISPLAY_MSG_UNBIND:
-			for (int i = 0; i < MAX_BUFS; i++) {
-				if (v->bufs[i].wlbuf != NULL)
-					wl_buffer_destroy(v->bufs[i].wlbuf);
-				v->bufs[i].wlbuf = NULL;
-				v->bufs[i].used = false;
-			}
+			for (int i = 0; i < MAX_BUFS; i++)
+				if (v->bufs[i].used)
+					buf_release(v, &v->bufs[i]);
 			break;
 		default:
-			break;	/* skip by length */
+			break;
 		}
-
 		memmove(v->inbuf, v->inbuf + hdr.len, v->inlen - hdr.len);
 		v->inlen -= hdr.len;
 	}
 
 	if (fd >= 0)
-		close(fd);	/* arrived with a message that did not want it */
+		close(fd);
 	return (true);
 }
 
@@ -376,31 +475,31 @@ static const struct xdg_surface_listener xdg_surface_listener = {
 
 static void
 toplevel_configure(void *data, struct xdg_toplevel *t __attribute__((unused)),
-    int32_t w, int32_t h, struct wl_array *states __attribute__((unused)))
+    int32_t w, int32_t h, struct wl_array *st __attribute__((unused)))
 {
 	struct view *v = data;
 
 	if (w > 0 && h > 0) {
 		v->win_w = w;
 		v->win_h = h;
+		if (v->egl_window != NULL)
+			wl_egl_window_resize(v->egl_window, w, h, 0, 0);
 	}
 }
 
 static void
 toplevel_close(void *data, struct xdg_toplevel *t __attribute__((unused)))
 {
-	struct view *v = data;
 
-	v->running = false;
+	((struct view *)data)->running = false;
 }
 
 static const struct xdg_toplevel_listener toplevel_listener = {
-	.configure = toplevel_configure,
-	.close = toplevel_close,
+	.configure = toplevel_configure, .close = toplevel_close,
 };
 
 static void
-wm_base_ping(void *data __attribute__((unused)), struct xdg_wm_base *b,
+wm_base_ping(void *d __attribute__((unused)), struct xdg_wm_base *b,
     uint32_t serial)
 {
 
@@ -411,23 +510,20 @@ static const struct xdg_wm_base_listener wm_base_listener = {
 	.ping = wm_base_ping,
 };
 
-/* --- input --- */
-
 static void
 kbd_key(void *data, struct wl_keyboard *k __attribute__((unused)),
-    uint32_t serial __attribute__((unused)),
-    uint32_t time __attribute__((unused)), uint32_t key, uint32_t state)
+    uint32_t s __attribute__((unused)), uint32_t t __attribute__((unused)),
+    uint32_t key, uint32_t state)
 {
-	struct view *v = data;
 
 	/* wl_keyboard.key carries the evdev keycode directly. */
-	send_key(v, key, state == WL_KEYBOARD_KEY_STATE_PRESSED);
+	send_key(data, key, state == WL_KEYBOARD_KEY_STATE_PRESSED);
 }
 
 static void kbd_keymap(void *d __attribute__((unused)),
     struct wl_keyboard *k __attribute__((unused)),
-    uint32_t f __attribute__((unused)), int32_t fd, uint32_t sz
-    __attribute__((unused))) { if (fd >= 0) close(fd); }
+    uint32_t f __attribute__((unused)), int32_t fd,
+    uint32_t sz __attribute__((unused))) { if (fd >= 0) close(fd); }
 static void kbd_enter(void *d __attribute__((unused)),
     struct wl_keyboard *k __attribute__((unused)),
     uint32_t s __attribute__((unused)),
@@ -437,41 +533,37 @@ static void kbd_leave(void *d __attribute__((unused)),
     struct wl_keyboard *k __attribute__((unused)),
     uint32_t s __attribute__((unused)),
     struct wl_surface *su __attribute__((unused))) {}
-static void kbd_modifiers(void *d __attribute__((unused)),
+static void kbd_mods(void *d __attribute__((unused)),
     struct wl_keyboard *k __attribute__((unused)),
-    uint32_t s __attribute__((unused)), uint32_t md __attribute__((unused)),
-    uint32_t ml __attribute__((unused)), uint32_t lk __attribute__((unused)),
+    uint32_t s __attribute__((unused)), uint32_t a __attribute__((unused)),
+    uint32_t b __attribute__((unused)), uint32_t c __attribute__((unused)),
     uint32_t g __attribute__((unused))) {}
-static void kbd_repeat(void *d __attribute__((unused)),
+static void kbd_rep(void *d __attribute__((unused)),
     struct wl_keyboard *k __attribute__((unused)),
     int32_t r __attribute__((unused)), int32_t dl __attribute__((unused))) {}
 
 static const struct wl_keyboard_listener kbd_listener = {
 	.keymap = kbd_keymap, .enter = kbd_enter, .leave = kbd_leave,
-	.key = kbd_key, .modifiers = kbd_modifiers,
-	.repeat_info = kbd_repeat,
+	.key = kbd_key, .modifiers = kbd_mods, .repeat_info = kbd_rep,
 };
+
+static uint32_t ptr_buttons;
 
 static void
 ptr_motion(void *data, struct wl_pointer *p __attribute__((unused)),
-    uint32_t time __attribute__((unused)), wl_fixed_t sx, wl_fixed_t sy)
+    uint32_t t __attribute__((unused)), wl_fixed_t sx, wl_fixed_t sy)
 {
-	struct view *v = data;
-	static uint32_t buttons;
 
-	send_ptr(v, buttons, wl_fixed_to_int(sx), wl_fixed_to_int(sy));
+	send_ptr(data, ptr_buttons, wl_fixed_to_int(sx), wl_fixed_to_int(sy));
 }
 
 static void
 ptr_button(void *data, struct wl_pointer *p __attribute__((unused)),
-    uint32_t serial __attribute__((unused)),
-    uint32_t time __attribute__((unused)), uint32_t button, uint32_t state)
+    uint32_t s __attribute__((unused)), uint32_t t __attribute__((unused)),
+    uint32_t button, uint32_t state)
 {
-	struct view *v = data;
-	static uint32_t buttons;
 	uint32_t bit;
 
-	/* BTN_LEFT/RIGHT/MIDDLE -> the mask console_ptr_event expects. */
 	switch (button) {
 	case 0x110: bit = 0x01; break;	/* BTN_LEFT */
 	case 0x111: bit = 0x04; break;	/* BTN_RIGHT */
@@ -479,10 +571,10 @@ ptr_button(void *data, struct wl_pointer *p __attribute__((unused)),
 	default: return;
 	}
 	if (state)
-		buttons |= bit;
+		ptr_buttons |= bit;
 	else
-		buttons &= ~bit;
-	send_ptr(v, buttons, 0, 0);
+		ptr_buttons &= ~bit;
+	send_ptr(data, ptr_buttons, 0, 0);
 }
 
 static void ptr_enter(void *d __attribute__((unused)),
@@ -501,21 +593,21 @@ static void ptr_axis(void *d __attribute__((unused)),
     wl_fixed_t val __attribute__((unused))) {}
 static void ptr_frame(void *d __attribute__((unused)),
     struct wl_pointer *p __attribute__((unused))) {}
-static void ptr_axis_src(void *d __attribute__((unused)),
+static void ptr_asrc(void *d __attribute__((unused)),
     struct wl_pointer *p __attribute__((unused)),
     uint32_t s __attribute__((unused))) {}
-static void ptr_axis_stop(void *d __attribute__((unused)),
+static void ptr_astop(void *d __attribute__((unused)),
     struct wl_pointer *p __attribute__((unused)),
     uint32_t t __attribute__((unused)), uint32_t a __attribute__((unused))) {}
-static void ptr_axis_disc(void *d __attribute__((unused)),
+static void ptr_adisc(void *d __attribute__((unused)),
     struct wl_pointer *p __attribute__((unused)),
     uint32_t a __attribute__((unused)), int32_t dc __attribute__((unused))) {}
 
 static const struct wl_pointer_listener ptr_listener = {
 	.enter = ptr_enter, .leave = ptr_leave, .motion = ptr_motion,
 	.button = ptr_button, .axis = ptr_axis, .frame = ptr_frame,
-	.axis_source = ptr_axis_src, .axis_stop = ptr_axis_stop,
-	.axis_discrete = ptr_axis_disc,
+	.axis_source = ptr_asrc, .axis_stop = ptr_astop,
+	.axis_discrete = ptr_adisc,
 };
 
 static void
@@ -543,7 +635,7 @@ static const struct wl_seat_listener seat_listener = {
 
 static void
 registry_global(void *data, struct wl_registry *reg, uint32_t name,
-    const char *iface, uint32_t version)
+    const char *iface, uint32_t version __attribute__((unused)))
 {
 	struct view *v = data;
 
@@ -554,10 +646,7 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name,
 		v->wm_base = wl_registry_bind(reg, name,
 		    &xdg_wm_base_interface, 1);
 		xdg_wm_base_add_listener(v->wm_base, &wm_base_listener, v);
-	} else if (strcmp(iface, zwp_linux_dmabuf_v1_interface.name) == 0)
-		v->dmabuf = wl_registry_bind(reg, name,
-		    &zwp_linux_dmabuf_v1_interface, version < 3 ? version : 3);
-	else if (strcmp(iface, wl_seat_interface.name) == 0) {
+	} else if (strcmp(iface, wl_seat_interface.name) == 0) {
 		v->seat = wl_registry_bind(reg, name, &wl_seat_interface, 5);
 		wl_seat_add_listener(v->seat, &seat_listener, v);
 	}
@@ -573,13 +662,59 @@ static const struct wl_registry_listener registry_listener = {
 
 /* ------------------------------------------------------------------ */
 
+static bool
+egl_setup(struct view *v)
+{
+	static const EGLint cfg_attrs[] = {
+		EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+		EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+		EGL_NONE
+	};
+	static const EGLint ctx_attrs[] = {
+		EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE
+	};
+	EGLint n = 0, major, minor;
+
+	v->egl_dpy = eglGetDisplay((EGLNativeDisplayType)v->dpy);
+	if (v->egl_dpy == EGL_NO_DISPLAY ||
+	    !eglInitialize(v->egl_dpy, &major, &minor)) {
+		fprintf(stderr, "bhyve-viewer: eglInitialize failed\n");
+		return (false);
+	}
+	if (!eglBindAPI(EGL_OPENGL_ES_API) ||
+	    !eglChooseConfig(v->egl_dpy, cfg_attrs, &v->egl_cfg, 1, &n) ||
+	    n == 0) {
+		fprintf(stderr, "bhyve-viewer: no usable EGL config\n");
+		return (false);
+	}
+
+	p_eglCreateImageKHR = (void *)eglGetProcAddress("eglCreateImageKHR");
+	p_eglDestroyImageKHR = (void *)eglGetProcAddress("eglDestroyImageKHR");
+	p_glEGLImageTargetTexture2DOES =
+	    (void *)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+	if (p_eglCreateImageKHR == NULL || p_eglDestroyImageKHR == NULL ||
+	    p_glEGLImageTargetTexture2DOES == NULL) {
+		fprintf(stderr, "bhyve-viewer: EGL lacks dma_buf image import "
+		    "(needs EGL_EXT_image_dma_buf_import)\n");
+		return (false);
+	}
+
+	v->egl_ctx = eglCreateContext(v->egl_dpy, v->egl_cfg, EGL_NO_CONTEXT,
+	    ctx_attrs);
+	if (v->egl_ctx == EGL_NO_CONTEXT) {
+		fprintf(stderr, "bhyve-viewer: eglCreateContext failed\n");
+		return (false);
+	}
+	return (true);
+}
+
 static int
 connect_socket(const char *path)
 {
 	struct sockaddr_un sun;
-	int fd;
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 
-	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0)
 		return (-1);
 	memset(&sun, 0, sizeof(sun));
@@ -597,50 +732,45 @@ main(int argc, char **argv)
 {
 	struct view v;
 	struct pollfd pfd[2];
-
-	{
-		int c;
-
-		while ((c = getopt(argc, argv, "f:m:o:")) != -1) {
-			switch (c) {
-			case 'f':	/* e.g. -f XR24 */
-				if (strlen(optarg) == 4)
-					opt_fourcc = (uint32_t)optarg[0] |
-					    ((uint32_t)optarg[1] << 8) |
-					    ((uint32_t)optarg[2] << 16) |
-					    ((uint32_t)optarg[3] << 24);
-				else
-					opt_fourcc = (uint32_t)strtoul(optarg,
-					    NULL, 0);
-				break;
-			case 'm':
-				opt_modifier = strtoull(optarg, NULL, 0);
-				opt_modifier_set = true;
-				break;
-			case 'o':
-				opt_offset = (int32_t)strtol(optarg, NULL, 0);
-				break;
-			default:
-				goto usage;
-			}
-		}
-		argc -= optind;
-		argv += optind;
-	}
-	if (argc != 1) {
-usage:
-		fprintf(stderr, "usage: bhyve-viewer [-f fourcc] "
-		    "[-m modifier] [-o offset] <socket-path>\n"
-		    "  -f  four character code, e.g. XR24, or a number\n"
-		    "  -m  DRM format modifier, e.g. 0 for linear\n"
-		    "  -o  byte offset of plane 0 in the dma_buf\n");
-		return (1);
-	}
+	int c;
 
 	memset(&v, 0, sizeof(v));
 	v.running = true;
 	v.win_w = 1920;
 	v.win_h = 1080;
+
+	while ((c = getopt(argc, argv, "f:o:F")) != -1) {
+		switch (c) {
+		case 'f':
+			if (strlen(optarg) == 4)
+				opt_fourcc = (uint32_t)optarg[0] |
+				    ((uint32_t)optarg[1] << 8) |
+				    ((uint32_t)optarg[2] << 16) |
+				    ((uint32_t)optarg[3] << 24);
+			else
+				opt_fourcc = (uint32_t)strtoul(optarg, NULL, 0);
+			break;
+		case 'o':
+			opt_offset = (int32_t)strtol(optarg, NULL, 0);
+			break;
+		case 'F':
+			opt_flip = true;
+			break;
+		default:
+			goto usage;
+		}
+	}
+	argc -= optind;
+	argv += optind;
+	if (argc != 1) {
+usage:
+		fprintf(stderr, "usage: bhyve-viewer [-f fourcc] [-o offset] "
+		    "[-F] <socket-path>\n"
+		    "  -f  four character code, e.g. XR24\n"
+		    "  -o  byte offset of plane 0\n"
+		    "  -F  flip vertically, if the image is upside down\n");
+		return (1);
+	}
 
 	v.sock = connect_socket(argv[0]);
 	if (v.sock < 0) {
@@ -659,12 +789,13 @@ usage:
 	wl_registry_add_listener(v.registry, &registry_listener, &v);
 	wl_display_roundtrip(v.dpy);
 
-	if (v.compositor == NULL || v.wm_base == NULL || v.dmabuf == NULL) {
-		fprintf(stderr, "bhyve-viewer: compositor lacks %s\n",
-		    v.dmabuf == NULL ? "zwp_linux_dmabuf_v1" :
-		    "wl_compositor/xdg_wm_base");
+	if (v.compositor == NULL || v.wm_base == NULL) {
+		fprintf(stderr, "bhyve-viewer: compositor lacks "
+		    "wl_compositor or xdg_wm_base\n");
 		return (1);
 	}
+	if (!egl_setup(&v))
+		return (1);
 
 	v.surface = wl_compositor_create_surface(v.compositor);
 	v.xsurface = xdg_wm_base_get_xdg_surface(v.wm_base, v.surface);
@@ -674,6 +805,20 @@ usage:
 	xdg_toplevel_set_title(v.toplevel, "bhyve");
 	wl_surface_commit(v.surface);
 	wl_display_roundtrip(v.dpy);
+
+	v.egl_window = wl_egl_window_create(v.surface, v.win_w, v.win_h);
+	v.egl_surf = eglCreateWindowSurface(v.egl_dpy, v.egl_cfg,
+	    (EGLNativeWindowType)v.egl_window, NULL);
+	if (v.egl_surf == EGL_NO_SURFACE) {
+		fprintf(stderr, "bhyve-viewer: eglCreateWindowSurface failed\n");
+		return (1);
+	}
+	if (!eglMakeCurrent(v.egl_dpy, v.egl_surf, v.egl_surf, v.egl_ctx)) {
+		fprintf(stderr, "bhyve-viewer: eglMakeCurrent failed\n");
+		return (1);
+	}
+	if (!gl_setup(&v))
+		return (1);
 
 	while (v.running) {
 		wl_display_flush(v.dpy);
@@ -688,19 +833,18 @@ usage:
 				continue;
 			break;
 		}
-		if (pfd[0].revents & POLLIN) {
-			if (wl_display_dispatch(v.dpy) < 0)
-				break;
-		}
-		if (pfd[1].revents & (POLLIN | POLLHUP)) {
-			if (!sock_readable(&v)) {
-				fprintf(stderr, "bhyve-viewer: bhyve closed the "
-				    "connection\n");
-				break;
-			}
+		if ((pfd[0].revents & POLLIN) && wl_display_dispatch(v.dpy) < 0)
+			break;
+		if ((pfd[1].revents & (POLLIN | POLLHUP)) &&
+		    !sock_readable(&v)) {
+			fprintf(stderr, "bhyve-viewer: bhyve closed the "
+			    "connection\n");
+			break;
 		}
 	}
 
+	eglMakeCurrent(v.egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
+	    EGL_NO_CONTEXT);
 	wl_display_disconnect(v.dpy);
 	close(v.sock);
 	return (0);
