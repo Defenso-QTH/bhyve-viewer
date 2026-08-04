@@ -1,9 +1,9 @@
-# bhyve-view: present a bhyve guest's GPU output in a host Wayland window.
+# bhyve-viewer: present a bhyve guest's GPU output in a host Wayland window.
 #
 # Plain BSD make; the only dependencies are wayland-client and the protocol
 # XML from wayland-protocols, both found through pkg-config.
 
-PROG=	bhyve-view
+PROG=	bhyve-viewer
 SRCS=	main.c xdg-shell-protocol.c linux-dmabuf-v1-protocol.c
 MAN=
 

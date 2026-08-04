@@ -1,4 +1,4 @@
-# bhyve-view
+# bhyve-viewer
 
 Presents a bhyve guest's GPU output in a window on the host's Wayland
 compositor, with no copy and no video encoding anywhere in the path.
@@ -31,7 +31,7 @@ socket.
 
 ## Use
 
-    bhyve-view /path/to/socket
+    bhyve-viewer /path/to/socket
 
 Keyboard and pointer events are forwarded to the guest through bhyve's existing
 console layer, so they arrive at whatever keyboard and tablet the guest was

@@ -1,4 +1,4 @@
 *.o
 *-protocol.c
 *-client-protocol.h
-bhyve-view
+bhyve-viewer

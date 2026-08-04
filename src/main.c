@@ -5,7 +5,7 @@
  */
 
 /*
- * bhyve-view: present a bhyve guest's GPU output in a host Wayland window.
+ * bhyve-viewer: present a bhyve guest's GPU output in a host Wayland window.
  *
  * The guest already renders on the host GPU -- with venus its images never
  * leave host GPU memory -- so bhyve exports the scanout as a dma_buf and
@@ -152,7 +152,7 @@ dmabuf_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
 {
 	struct buf *b = data;
 
-	fprintf(stderr, "bhyve-view: compositor rejected dma_buf for buffer %u\n",
+	fprintf(stderr, "bhyve-viewer: compositor rejected dma_buf for buffer %u\n",
 	    b->id);
 	b->used = false;
 	zwp_linux_buffer_params_v1_destroy(params);
@@ -171,12 +171,12 @@ handle_scanout(struct view *v, const struct gpu_display_scanout *so, int fd)
 	int slot = -1;
 
 	if (fd < 0) {
-		fprintf(stderr, "bhyve-view: scanout %u arrived with no fd\n",
+		fprintf(stderr, "bhyve-viewer: scanout %u arrived with no fd\n",
 		    so->buffer_id);
 		return;
 	}
 	if (so->transport != GPU_DISPLAY_XPORT_DMABUF) {
-		fprintf(stderr, "bhyve-view: transport %u not supported yet\n",
+		fprintf(stderr, "bhyve-viewer: transport %u not supported yet\n",
 		    so->transport);
 		close(fd);
 		return;
@@ -188,7 +188,7 @@ handle_scanout(struct view *v, const struct gpu_display_scanout *so, int fd)
 		for (int i = 0; i < MAX_BUFS; i++)
 			if (!v->bufs[i].used) { slot = i; break; }
 		if (slot < 0) {
-			fprintf(stderr, "bhyve-view: out of buffer slots\n");
+			fprintf(stderr, "bhyve-viewer: out of buffer slots\n");
 			close(fd);
 			return;
 		}
@@ -287,7 +287,7 @@ sock_readable(struct view *v)
 			break;
 		memcpy(&hdr, v->inbuf, sizeof(hdr));
 		if (hdr.len < sizeof(hdr) || hdr.len > sizeof(v->inbuf)) {
-			fprintf(stderr, "bhyve-view: bad message length %u\n",
+			fprintf(stderr, "bhyve-viewer: bad message length %u\n",
 			    hdr.len);
 			return (false);
 		}
@@ -299,7 +299,7 @@ sock_readable(struct view *v)
 			const struct gpu_display_hello *h = (const void *)v->inbuf;
 
 			if (h->version != GPU_DISPLAY_VERSION)
-				fprintf(stderr, "bhyve-view: protocol %u, "
+				fprintf(stderr, "bhyve-viewer: protocol %u, "
 				    "expected %u -- continuing anyway\n",
 				    h->version, GPU_DISPLAY_VERSION);
 			break;
@@ -574,7 +574,7 @@ main(int argc, char **argv)
 	struct pollfd pfd[2];
 
 	if (argc != 2) {
-		fprintf(stderr, "usage: bhyve-view <socket-path>\n");
+		fprintf(stderr, "usage: bhyve-viewer <socket-path>\n");
 		return (1);
 	}
 
@@ -585,14 +585,14 @@ main(int argc, char **argv)
 
 	v.sock = connect_socket(argv[1]);
 	if (v.sock < 0) {
-		fprintf(stderr, "bhyve-view: cannot connect to %s: %s\n",
+		fprintf(stderr, "bhyve-viewer: cannot connect to %s: %s\n",
 		    argv[1], strerror(errno));
 		return (1);
 	}
 
 	v.dpy = wl_display_connect(NULL);
 	if (v.dpy == NULL) {
-		fprintf(stderr, "bhyve-view: no Wayland display "
+		fprintf(stderr, "bhyve-viewer: no Wayland display "
 		    "(is WAYLAND_DISPLAY set?)\n");
 		return (1);
 	}
@@ -601,7 +601,7 @@ main(int argc, char **argv)
 	wl_display_roundtrip(v.dpy);
 
 	if (v.compositor == NULL || v.wm_base == NULL || v.dmabuf == NULL) {
-		fprintf(stderr, "bhyve-view: compositor lacks %s\n",
+		fprintf(stderr, "bhyve-viewer: compositor lacks %s\n",
 		    v.dmabuf == NULL ? "zwp_linux_dmabuf_v1" :
 		    "wl_compositor/xdg_wm_base");
 		return (1);
@@ -635,7 +635,7 @@ main(int argc, char **argv)
 		}
 		if (pfd[1].revents & (POLLIN | POLLHUP)) {
 			if (!sock_readable(&v)) {
-				fprintf(stderr, "bhyve-view: bhyve closed the "
+				fprintf(stderr, "bhyve-viewer: bhyve closed the "
 				    "connection\n");
 				break;
 			}
