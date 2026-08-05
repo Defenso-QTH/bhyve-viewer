@@ -105,6 +105,14 @@ struct view {
 	int32_t		win_w, win_h;
 	bool		configured;
 	bool		running;
+	/*
+	 * Newest buffer the guest has flipped to, drawn once per loop pass.
+	 * The guest flips at its own rate; drawing every flip means blocking
+	 * in eglSwapBuffers as often as the guest presents, which starves the
+	 * Wayland event loop and stops input being dispatched at all.
+	 */
+	uint32_t	pending_buf;
+	bool		have_pending;
 };
 
 static PFNEGLCREATEIMAGEKHRPROC		p_eglCreateImageKHR;
@@ -388,7 +396,9 @@ handle_frame(struct view *v, const struct gpu_display_frame *f)
 
 	if (b == NULL || b->tex == 0 || !v->configured)
 		return;
-	draw(v, b);
+	/* Coalesce: only the most recent flip is worth drawing. */
+	v->pending_buf = f->buffer_id;
+	v->have_pending = true;
 }
 
 static bool
@@ -840,6 +850,13 @@ usage:
 	}
 	if (!gl_setup(&v))
 		return (1);
+	/*
+	 * Do not wait for the host compositor's frame callback inside
+	 * eglSwapBuffers.  Blocking there ties this process's event loop to
+	 * the host refresh while the guest presents independently, and any
+	 * time spent blocked is time input is not dispatched.
+	 */
+	eglSwapInterval(v.egl_dpy, 0);
 
 	while (v.running) {
 		/*
@@ -883,6 +900,14 @@ usage:
 			fprintf(stderr, "bhyve-viewer: bhyve closed the "
 			    "connection\n");
 			break;
+		}
+
+		if (v.have_pending) {
+			struct buf *b = buf_find(&v, v.pending_buf);
+
+			v.have_pending = false;
+			if (b != NULL && b->tex != 0)
+				draw(&v, b);
 		}
 	}
 
