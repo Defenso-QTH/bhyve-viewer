@@ -87,6 +87,7 @@ static long	opt_min_frame_ms;
 /* Frames the guest presented, and frames actually drawn, since the last report. */
 static uintmax_t	stat_frames_in, stat_frames_drawn;
 static uintmax_t	evictions;
+static uintmax_t	stale_cbs;
 static uint64_t		draw_seq;
 static struct timespec	stat_since;
 static uint32_t	single_id;
@@ -157,8 +158,16 @@ struct view {
 	struct timespec	last_draw;
 };
 
-/* Milliseconds before a missing frame callback is treated as having fired. */
-#define	FRAME_CB_TIMEOUT_MS	100
+/*
+ * Milliseconds before a missing frame callback is treated as having fired.
+ *
+ * This is a fallback, not a frame rate -- but it becomes the frame rate
+ * whenever callbacks stop arriving, so it has to be short enough not to be
+ * noticed.  At 100ms the viewer drew 9 frames a second against a guest
+ * presenting 60, and the entire pacing scheme was running on this timer
+ * without any sign that the callbacks it was meant to follow never came.
+ */
+#define	FRAME_CB_TIMEOUT_MS	17
 
 static long
 ms_since(const struct timespec *then)
@@ -440,10 +449,20 @@ draw(struct view *v, struct buf *b, int fence_fd)
 	 * the surface -- requesting it afterwards attaches it to the next
 	 * commit instead and costs a frame of latency.
 	 */
-	if (v->frame_cb == NULL) {
-		v->frame_cb = wl_surface_frame(v->surface);
-		wl_callback_add_listener(v->frame_cb, &frame_listener, v);
+	/*
+	 * Replace a callback that never fired rather than waiting on it
+	 * forever: holding a stale one means never asking again, so a single
+	 * missed callback would drop us onto the timer permanently.
+	 */
+	if (v->frame_cb != NULL) {
+		wl_callback_destroy(v->frame_cb);
+		v->frame_cb = NULL;
+		if (stale_cbs++ < 3)
+			fprintf(stderr, "bhyve-viewer: frame callback did not "
+			    "arrive, re-requesting\n");
 	}
+	v->frame_cb = wl_surface_frame(v->surface);
+	wl_callback_add_listener(v->frame_cb, &frame_listener, v);
 	v->frame_ready = false;
 	clock_gettime(CLOCK_MONOTONIC, &v->last_draw);
 
