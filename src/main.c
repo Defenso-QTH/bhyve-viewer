@@ -341,11 +341,19 @@ draw(struct view *v, struct buf *b, int fence_fd)
 		} else {
 			fprintf(stderr, "bhyve-viewer: eglCreateSyncKHR "
 			    "failed (0x%x); drawing unsynchronised\n",
-			    eglGetError()); {
+			    eglGetError());
 			close(fence_fd);
 		}
-	} else if (fence_fd >= 0)
+	} else if (fence_fd >= 0) {
+		static bool warned;
+
+		if (!warned) {
+			warned = true;
+			fprintf(stderr, "bhyve-viewer: fence arrived but no "
+			    "EGL sync support; drawing unsynchronised\n");
+		}
 		close(fence_fd);
+	}
 
 	glViewport(0, 0, v->win_w, v->win_h);
 	glUseProgram(v->prog);
