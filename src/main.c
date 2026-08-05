@@ -65,6 +65,7 @@
 static uint32_t	opt_fourcc;
 static int32_t	opt_offset = -1;
 static bool	opt_flip;
+static bool	opt_verbose;	/* -v: report every input event, not a sample */
 
 struct buf {
 	uint32_t	id;
@@ -196,9 +197,11 @@ send_key(struct view *v, uint32_t evdev, bool down)
 	if (!send_msg(v, &k, sizeof(k)))
 		fprintf(stderr, "bhyve-viewer: key send failed: %s\n",
 		    strerror(errno));
-	else if (keys_sent++ < 5)
-		fprintf(stderr, "bhyve-viewer: sent key evdev=%u xt=0x%x %s\n",
-		    evdev, xt, down ? "down" : "up");
+	else if (opt_verbose || keys_sent < 5)
+		fprintf(stderr, "bhyve-viewer: sent key #%ju evdev=%u xt=0x%x "
+		    "%s\n", (uintmax_t)keys_sent + 1, evdev, xt,
+		    down ? "down" : "up");
+	keys_sent++;
 }
 
 static void
@@ -225,9 +228,10 @@ send_ptr(struct view *v, uint32_t buttons, int32_t x, int32_t y)
 	if (!send_msg(v, &p, sizeof(p)))
 		fprintf(stderr, "bhyve-viewer: ptr send failed: %s\n",
 		    strerror(errno));
-	else if (ptrs_sent++ < 5)
-		fprintf(stderr, "bhyve-viewer: sent ptr buttons=0x%x %d,%d\n",
-		    buttons, p.x, p.y);
+	else if (opt_verbose || ptrs_sent < 5)
+		fprintf(stderr, "bhyve-viewer: sent ptr #%ju buttons=0x%x "
+		    "%d,%d\n", (uintmax_t)ptrs_sent + 1, buttons, p.x, p.y);
+	ptrs_sent++;
 }
 
 /* ------------------------------------------------------------------ */
@@ -878,7 +882,7 @@ main(int argc, char **argv)
 	v.win_w = 1920;
 	v.win_h = 1080;
 
-	while ((c = getopt(argc, argv, "f:o:F")) != -1) {
+	while ((c = getopt(argc, argv, "f:o:Fv")) != -1) {
 		switch (c) {
 		case 'f':
 			if (strlen(optarg) == 4)
@@ -895,6 +899,9 @@ main(int argc, char **argv)
 		case 'F':
 			opt_flip = true;
 			break;
+		case 'v':
+			opt_verbose = true;
+			break;
 		default:
 			goto usage;
 		}
@@ -907,7 +914,8 @@ usage:
 		    "[-F] <socket-path>\n"
 		    "  -f  four character code, e.g. XR24\n"
 		    "  -o  byte offset of plane 0\n"
-		    "  -F  flip vertically, if the image is upside down\n");
+		    "  -F  flip vertically, if the image is upside down\n"
+		    "  -v  report every input event rather than a sample\n");
 		return (1);
 	}
 
@@ -1026,6 +1034,9 @@ usage:
 				close(fence);
 		}
 	}
+
+	fprintf(stderr, "bhyve-viewer: sent %ju key and %ju pointer events\n",
+	    (uintmax_t)keys_sent, (uintmax_t)ptrs_sent);
 
 	/* Do not leave the guest holding keys because we exited. */
 	for (uint32_t code = 0; code < 256; code++)
