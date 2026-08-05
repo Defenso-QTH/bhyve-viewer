@@ -76,6 +76,13 @@ static bool	opt_verbose;	/* -v: report every input event, not a sample */
  * on screen, no amount of buffer bookkeeping explains it.
  */
 static bool	opt_single;
+/*
+ * -r: cap the draw rate.  At a few frames a second the eye cannot merge
+ * successive frames, so a smoothly stepping cube means each frame is fine and
+ * the artefact is in which frame is shown when; a cube that still looks
+ * doubled at 4fps means the doubling is inside a single presented frame.
+ */
+static long	opt_min_frame_ms;
 static uint32_t	single_id;
 static bool	have_single_id;
 
@@ -1034,7 +1041,7 @@ main(int argc, char **argv)
 	v.win_w = 1920;
 	v.win_h = 1080;
 
-	while ((c = getopt(argc, argv, "f:o:Fv1")) != -1) {
+	while ((c = getopt(argc, argv, "f:o:Fv1r:")) != -1) {
 		switch (c) {
 		case 'f':
 			if (strlen(optarg) == 4)
@@ -1057,6 +1064,13 @@ main(int argc, char **argv)
 		case '1':
 			opt_single = true;
 			break;
+		case 'r': {
+			int fps = atoi(optarg);
+
+			if (fps > 0)
+				opt_min_frame_ms = 1000 / fps;
+			break;
+		}
 		default:
 			goto usage;
 		}
@@ -1071,7 +1085,8 @@ usage:
 		    "  -o  byte offset of plane 0\n"
 		    "  -F  flip vertically, if the image is upside down\n"
 		    "  -v  report every input event rather than a sample\n"
-		    "  -1  show only the first buffer (doubling diagnostic)\n");
+		    "  -1  show only the first buffer (doubling diagnostic)\n"
+		    "  -r  cap the draw rate, in frames per second\n");
 		return (1);
 	}
 
@@ -1167,6 +1182,8 @@ usage:
 		 */
 		timeout = (v.have_pending && !v.frame_ready) ?
 		    FRAME_CB_TIMEOUT_MS : -1;
+		if (v.have_pending && opt_min_frame_ms > 0)
+			timeout = 5;	/* re-check the rate cap promptly */
 
 		if (poll(pfd, 2, timeout) < 0) {
 			wl_display_cancel_read(v.dpy);
@@ -1195,7 +1212,10 @@ usage:
 		 * coalesced, so the newest is the only one that matters and
 		 * nothing is queued up waiting for us.
 		 */
-		if (v.have_pending && (v.frame_ready ||
+		if (v.have_pending && opt_min_frame_ms > 0 &&
+		    ms_since(&v.last_draw) < opt_min_frame_ms) {
+			/* rate-capped: leave it pending, draw it later */
+		} else if (v.have_pending && (v.frame_ready ||
 		    ms_since(&v.last_draw) >= FRAME_CB_TIMEOUT_MS)) {
 			struct buf *b = buf_find(&v, v.pending_buf);
 			int fence = v.pending_fence;
