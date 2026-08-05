@@ -35,6 +35,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,6 +147,22 @@ static uint64_t keys_sent, ptrs_sent;
  * bhyve's own VNC, not just this viewer.
  */
 static uint8_t	key_is_down[256 / 8];
+
+/*
+ * Set by SIGINT/SIGTERM so the main loop exits by its normal path, which
+ * releases any keys the guest still thinks are down.  Quitting without that
+ * leaves a stuck modifier behind, and since the emulated keyboard is shared it
+ * breaks every other input path until something happens to clear it.
+ * SIGKILL cannot be caught, so `kill -9` will still strand them.
+ */
+static volatile sig_atomic_t quit_requested;
+
+static void
+on_signal(int sig __attribute__((unused)))
+{
+
+	quit_requested = 1;
+}
 
 static void
 key_mark(uint32_t evdev, bool down)
@@ -949,7 +966,11 @@ usage:
 	 */
 	eglSwapInterval(v.egl_dpy, 0);
 
-	while (v.running) {
+	signal(SIGINT, on_signal);
+	signal(SIGTERM, on_signal);
+	signal(SIGHUP, on_signal);
+
+	while (v.running && !quit_requested) {
 		/*
 		 * eglSwapBuffers() dispatches its own Wayland queue, and doing
 		 * so drains the display fd.  Events for our proxies land in the
@@ -975,7 +996,7 @@ usage:
 		if (poll(pfd, 2, -1) < 0) {
 			wl_display_cancel_read(v.dpy);
 			if (errno == EINTR)
-				continue;
+				continue;	/* signal: loop re-checks quit */
 			break;
 		}
 
