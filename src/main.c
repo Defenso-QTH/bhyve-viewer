@@ -705,13 +705,22 @@ static const struct wl_keyboard_listener kbd_listener = {
 };
 
 static uint32_t ptr_buttons;
+/*
+ * Where the pointer was last seen, in surface coordinates.  Every event we
+ * send carries an absolute position because the guest tablet is absolute, so
+ * a button event has to repeat the current position -- sending 0,0 would
+ * click in the corner and then jump back on the next motion.
+ */
+static int32_t ptr_x, ptr_y;
 
 static void
 ptr_motion(void *data, struct wl_pointer *p __attribute__((unused)),
     uint32_t t __attribute__((unused)), wl_fixed_t sx, wl_fixed_t sy)
 {
 
-	send_ptr(data, ptr_buttons, wl_fixed_to_int(sx), wl_fixed_to_int(sy));
+	ptr_x = wl_fixed_to_int(sx);
+	ptr_y = wl_fixed_to_int(sy);
+	send_ptr(data, ptr_buttons, ptr_x, ptr_y);
 }
 
 static void
@@ -731,16 +740,22 @@ ptr_button(void *data, struct wl_pointer *p __attribute__((unused)),
 		ptr_buttons |= bit;
 	else
 		ptr_buttons &= ~bit;
-	send_ptr(data, ptr_buttons, 0, 0);
+	send_ptr(data, ptr_buttons, ptr_x, ptr_y);
 }
 
-static void ptr_enter(void *d __attribute__((unused)),
-    struct wl_pointer *p __attribute__((unused)),
+/*
+ * enter carries a position, and it is the only one we get if the pointer is
+ * warped into the surface and clicked without moving.
+ */
+static void ptr_enter(void *d, struct wl_pointer *p __attribute__((unused)),
     uint32_t s __attribute__((unused)),
     struct wl_surface *su __attribute__((unused)),
-    wl_fixed_t x __attribute__((unused)),
-    wl_fixed_t y __attribute__((unused)))
-{ fprintf(stderr, "bhyve-viewer: pointer entered\n"); }
+    wl_fixed_t x, wl_fixed_t y)
+{
+	ptr_x = wl_fixed_to_int(x);
+	ptr_y = wl_fixed_to_int(y);
+	send_ptr(d, ptr_buttons, ptr_x, ptr_y);
+}
 static void ptr_leave(void *d __attribute__((unused)),
     struct wl_pointer *p __attribute__((unused)),
     uint32_t s __attribute__((unused)),
