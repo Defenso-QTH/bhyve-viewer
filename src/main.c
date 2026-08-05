@@ -83,6 +83,10 @@ static bool	opt_single;
  * doubled at 4fps means the doubling is inside a single presented frame.
  */
 static long	opt_min_frame_ms;
+
+/* Frames the guest presented, and frames actually drawn, since the last report. */
+static uintmax_t	stat_frames_in, stat_frames_drawn;
+static struct timespec	stat_since;
 static uint32_t	single_id;
 static bool	have_single_id;
 
@@ -588,6 +592,31 @@ handle_frame(struct view *v, const struct gpu_display_frame *f, int fence_fd)
 	v->pending_buf = f->buffer_id;
 	v->pending_fence = fence_fd;
 	v->have_pending = true;
+	stat_frames_in++;
+}
+
+/*
+ * How fast the guest presents, against how fast we display.  A guest
+ * rendering far above the display rate is the difference between a smooth
+ * animation and successive frames far enough apart that the eye merges them.
+ */
+static void
+stats_tick(void)
+{
+	long ms;
+
+	if (stat_since.tv_sec == 0) {
+		clock_gettime(CLOCK_MONOTONIC, &stat_since);
+		return;
+	}
+	ms = ms_since(&stat_since);
+	if (ms < 1000)
+		return;
+	fprintf(stderr, "bhyve-viewer: guest presented %ju frames/s, drew "
+	    "%ju/s\n", stat_frames_in * 1000 / (uintmax_t)ms,
+	    stat_frames_drawn * 1000 / (uintmax_t)ms);
+	stat_frames_in = stat_frames_drawn = 0;
+	clock_gettime(CLOCK_MONOTONIC, &stat_since);
 }
 
 static bool
@@ -1199,6 +1228,8 @@ usage:
 		if (wl_display_dispatch_pending(v.dpy) < 0)
 			break;
 
+		stats_tick();
+
 		if ((pfd[1].revents & (POLLIN | POLLHUP)) &&
 		    !sock_readable(&v)) {
 			fprintf(stderr, "bhyve-viewer: bhyve closed the "
@@ -1222,8 +1253,10 @@ usage:
 
 			v.have_pending = false;
 			v.pending_fence = -1;
-			if (b != NULL && b->tex != 0)
+			if (b != NULL && b->tex != 0) {
 				draw(&v, b, fence);
+				stat_frames_drawn++;
+			}
 			else if (fence >= 0)
 				close(fence);
 		}
