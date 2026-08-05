@@ -842,6 +842,21 @@ usage:
 		return (1);
 
 	while (v.running) {
+		/*
+		 * eglSwapBuffers() dispatches its own Wayland queue, and doing
+		 * so drains the display fd.  Events for our proxies land in the
+		 * default queue already read from the socket, so a later poll()
+		 * reports nothing readable and they are never dispatched --
+		 * which is why input arrived during startup and then stopped
+		 * the moment frames began.
+		 *
+		 * prepare_read/read_events is the pattern that survives another
+		 * party reading the same fd: anything already queued is
+		 * dispatched before blocking, and the read is cancelled if we
+		 * wake for a different reason.
+		 */
+		while (wl_display_prepare_read(v.dpy) != 0)
+			wl_display_dispatch_pending(v.dpy);
 		wl_display_flush(v.dpy);
 
 		pfd[0].fd = wl_display_get_fd(v.dpy);
@@ -850,12 +865,19 @@ usage:
 		pfd[1].events = POLLIN;
 
 		if (poll(pfd, 2, -1) < 0) {
+			wl_display_cancel_read(v.dpy);
 			if (errno == EINTR)
 				continue;
 			break;
 		}
-		if ((pfd[0].revents & POLLIN) && wl_display_dispatch(v.dpy) < 0)
+
+		if (pfd[0].revents & POLLIN)
+			wl_display_read_events(v.dpy);
+		else
+			wl_display_cancel_read(v.dpy);
+		if (wl_display_dispatch_pending(v.dpy) < 0)
 			break;
+
 		if ((pfd[1].revents & (POLLIN | POLLHUP)) &&
 		    !sock_readable(&v)) {
 			fprintf(stderr, "bhyve-viewer: bhyve closed the "
