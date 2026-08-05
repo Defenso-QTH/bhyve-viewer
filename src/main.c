@@ -86,6 +86,8 @@ static long	opt_min_frame_ms;
 
 /* Frames the guest presented, and frames actually drawn, since the last report. */
 static uintmax_t	stat_frames_in, stat_frames_drawn;
+static uintmax_t	evictions;
+static uint64_t		draw_seq;
 static struct timespec	stat_since;
 static uint32_t	single_id;
 static bool	have_single_id;
@@ -96,6 +98,7 @@ struct buf {
 	EGLImageKHR	image;
 	GLuint		tex;
 	uint32_t	width, height;
+	uint64_t	last_used;	/* for eviction; 0 = never drawn */
 };
 
 struct view {
@@ -514,10 +517,37 @@ handle_scanout(struct view *v, const struct gpu_display_scanout *so, int fd)
 				slot = i;
 				break;
 			}
+		/*
+		 * All taken: drop the one drawn longest ago.  A guest that
+		 * cycles through scanout buffers -- as one presenting a
+		 * thousand frames a second does -- exhausts these in seconds,
+		 * and refusing the import meant carrying on displaying stale
+		 * buffers while the guest presented new ones.  Never evict the
+		 * frame waiting to be drawn.
+		 */
 		if (slot < 0) {
-			fprintf(stderr, "bhyve-viewer: out of buffer slots\n");
-			close(fd);
-			return;
+			uint64_t oldest = UINT64_MAX;
+
+			for (int i = 0; i < MAX_BUFS; i++) {
+				if (v->have_pending &&
+				    v->bufs[i].id == v->pending_buf)
+					continue;
+				if (v->bufs[i].last_used < oldest) {
+					oldest = v->bufs[i].last_used;
+					slot = i;
+				}
+			}
+			if (slot < 0) {
+				fprintf(stderr, "bhyve-viewer: no evictable "
+				    "buffer slot\n");
+				close(fd);
+				return;
+			}
+			if (evictions++ < 3)
+				fprintf(stderr, "bhyve-viewer: buffer slots "
+				    "full, evicting buffer %u\n",
+				    v->bufs[slot].id);
+			buf_release(v, &v->bufs[slot]);
 		}
 		b = &v->bufs[slot];
 	} else
@@ -685,7 +715,7 @@ sock_readable(struct view *v)
 			if (!f->has_fence) {
 				static uintmax_t unfenced;
 
-				if (opt_verbose || unfenced < 3)
+				if (unfenced < 3)
 					fprintf(stderr, "bhyve-viewer: frame "
 					    "#%ju arrived with no fence\n",
 					    (uintmax_t)unfenced + 1);
@@ -1254,6 +1284,7 @@ usage:
 			v.have_pending = false;
 			v.pending_fence = -1;
 			if (b != NULL && b->tex != 0) {
+				b->last_used = ++draw_seq;
 				draw(&v, b, fence);
 				stat_frames_drawn++;
 			}
