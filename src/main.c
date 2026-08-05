@@ -323,6 +323,7 @@ draw(struct view *v, struct buf *b, int fence_fd)
 	 * and part of the next.
 	 */
 	if (fence_fd >= 0 && p_eglCreateSyncKHR != NULL) {
+		static uintmax_t waits;
 		EGLint attrs[] = {
 			EGL_SYNC_NATIVE_FENCE_FD_ANDROID, fence_fd, EGL_NONE
 		};
@@ -333,7 +334,14 @@ draw(struct view *v, struct buf *b, int fence_fd)
 			/* eglCreateSyncKHR took the fd. */
 			p_eglWaitSyncKHR(v->egl_dpy, sync, 0);
 			p_eglDestroySyncKHR(v->egl_dpy, sync);
+			if (opt_verbose || waits < 3)
+				fprintf(stderr, "bhyve-viewer: waited on "
+				    "fence #%ju\n", (uintmax_t)waits + 1);
+			waits++;
 		} else {
+			fprintf(stderr, "bhyve-viewer: eglCreateSyncKHR "
+			    "failed (0x%x); drawing unsynchronised\n",
+			    eglGetError()); {
 			close(fence_fd);
 		}
 	} else if (fence_fd >= 0)
@@ -548,6 +556,15 @@ sock_readable(struct view *v)
 		case GPU_DISPLAY_MSG_FRAME: {
 			const struct gpu_display_frame *f = (const void *)v->inbuf;
 
+			if (!f->has_fence) {
+				static uintmax_t unfenced;
+
+				if (opt_verbose || unfenced < 3)
+					fprintf(stderr, "bhyve-viewer: frame "
+					    "#%ju arrived with no fence\n",
+					    (uintmax_t)unfenced + 1);
+				unfenced++;
+			}
 			handle_frame(v, f, f->has_fence ? fd : -1);
 			if (f->has_fence)
 				fd = -1;	/* consumed */
