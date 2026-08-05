@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <wayland-client.h>
@@ -127,7 +128,33 @@ struct view {
 	uint32_t	pending_buf;
 	bool		have_pending;
 	int		pending_fence;	/* sync_file for that buffer, or -1 */
+	/*
+	 * Drawing is paced by the host compositor's frame callback: we draw
+	 * at most one frame per callback, however many the guest presents in
+	 * between.  Without this a guest presenting faster than the host can
+	 * display keeps the loop inside eglSwapBuffers, and input is only
+	 * dispatched in the gaps between swaps.
+	 *
+	 * This is not eglSwapInterval(1): the callback tells us when to draw
+	 * next without blocking, so the loop stays free to service input.
+	 */
+	bool		frame_ready;
+	struct wl_callback *frame_cb;
+	struct timespec	last_draw;
 };
+
+/* Milliseconds before a missing frame callback is treated as having fired. */
+#define	FRAME_CB_TIMEOUT_MS	100
+
+static long
+ms_since(const struct timespec *then)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return ((now.tv_sec - then->tv_sec) * 1000 +
+	    (now.tv_nsec - then->tv_nsec) / 1000000);
+}
 
 static PFNEGLCREATESYNCKHRPROC		p_eglCreateSyncKHR;
 static PFNEGLDESTROYSYNCKHRPROC		p_eglDestroySyncKHR;
@@ -317,6 +344,24 @@ gl_setup(struct view *v)
 	return (true);
 }
 
+static void frame_done(void *data, struct wl_callback *cb, uint32_t t);
+
+static const struct wl_callback_listener frame_listener = {
+	.done = frame_done,
+};
+
+static void
+frame_done(void *data, struct wl_callback *cb,
+    uint32_t t __attribute__((unused)))
+{
+	struct view *v = data;
+
+	wl_callback_destroy(cb);
+	if (v->frame_cb == cb)
+		v->frame_cb = NULL;
+	v->frame_ready = true;
+}
+
 static void
 draw(struct view *v, struct buf *b, int fence_fd)
 {
@@ -375,6 +420,19 @@ draw(struct view *v, struct buf *b, int fence_fd)
 	glVertexAttribPointer(v->attr_pos, 2, GL_FLOAT, GL_FALSE, 0, quad);
 	glEnableVertexAttribArray(v->attr_pos);
 	glDrawArrays(GL_TRIANGLES, 0, 6);
+
+	/*
+	 * Ask for the callback before eglSwapBuffers, which is what commits
+	 * the surface -- requesting it afterwards attaches it to the next
+	 * commit instead and costs a frame of latency.
+	 */
+	if (v->frame_cb == NULL) {
+		v->frame_cb = wl_surface_frame(v->surface);
+		wl_callback_add_listener(v->frame_cb, &frame_listener, v);
+	}
+	v->frame_ready = false;
+	clock_gettime(CLOCK_MONOTONIC, &v->last_draw);
+
 	eglSwapBuffers(v->egl_dpy, v->egl_surf);
 }
 
@@ -943,6 +1001,7 @@ main(int argc, char **argv)
 	memset(&v, 0, sizeof(v));
 	v.running = true;
 	v.pending_fence = -1;
+	v.frame_ready = true;	/* nothing has been drawn yet */
 	v.win_w = 1920;
 	v.win_h = 1080;
 
@@ -1046,6 +1105,8 @@ usage:
 	signal(SIGTERM, on_signal);
 	signal(SIGHUP, on_signal);
 
+	int timeout;
+
 	while (v.running && !quit_requested) {
 		/*
 		 * eglSwapBuffers() dispatches its own Wayland queue, and doing
@@ -1069,7 +1130,16 @@ usage:
 		pfd[1].fd = v.sock;
 		pfd[1].events = POLLIN;
 
-		if (poll(pfd, 2, -1) < 0) {
+		/*
+		 * Block indefinitely unless a frame is waiting on the host
+		 * compositor's callback -- then wake up to draw it even if the
+		 * callback never arrives, which is what an occluded or hidden
+		 * surface looks like.
+		 */
+		timeout = (v.have_pending && !v.frame_ready) ?
+		    FRAME_CB_TIMEOUT_MS : -1;
+
+		if (poll(pfd, 2, timeout) < 0) {
 			wl_display_cancel_read(v.dpy);
 			if (errno == EINTR)
 				continue;	/* signal: loop re-checks quit */
@@ -1090,7 +1160,14 @@ usage:
 			break;
 		}
 
-		if (v.have_pending) {
+		/*
+		 * Draw at most one frame per host callback.  The guest may have
+		 * presented several since the last one; they have already been
+		 * coalesced, so the newest is the only one that matters and
+		 * nothing is queued up waiting for us.
+		 */
+		if (v.have_pending && (v.frame_ready ||
+		    ms_since(&v.last_draw) >= FRAME_CB_TIMEOUT_MS)) {
 			struct buf *b = buf_find(&v, v.pending_buf);
 			int fence = v.pending_fence;
 
