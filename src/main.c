@@ -745,6 +745,29 @@ static void kbd_keymap(void *d __attribute__((unused)),
     struct wl_keyboard *k __attribute__((unused)),
     uint32_t f __attribute__((unused)), int32_t fd,
     uint32_t sz __attribute__((unused))) { if (fd >= 0) close(fd); }
+/*
+ * Tell the guest every key we told it was down is now up.
+ *
+ * Called when focus goes away and when the seat withdraws the keyboard
+ * capability -- in both cases no release event is coming for a key held at
+ * the time, and the emulated keyboard is shared with every other input path,
+ * so one stuck modifier breaks bhyve's console too.
+ */
+static void
+release_held_keys(struct view *v)
+{
+	unsigned n = 0;
+
+	for (uint32_t code = 0; code < 256; code++)
+		if (key_is_down[code / 8] & (1u << (code % 8))) {
+			send_key(v, code, false);
+			n++;
+		}
+	if (n != 0)
+		fprintf(stderr, "bhyve-viewer: released %u held key%s\n",
+		    n, n == 1 ? "" : "s");
+}
+
 static void kbd_enter(void *d __attribute__((unused)),
     struct wl_keyboard *k __attribute__((unused)),
     uint32_t s __attribute__((unused)),
@@ -757,20 +780,7 @@ kbd_leave(void *data, struct wl_keyboard *k __attribute__((unused)),
     struct wl_surface *su __attribute__((unused)))
 {
 	struct view *v = data;
-	unsigned n = 0;
-
-	/*
-	 * Release anything still held.  Without this a modifier pressed as
-	 * focus moves away stays down in the guest for good, and since the
-	 * emulated keyboard is shared it breaks every other input path too.
-	 */
-	for (uint32_t code = 0; code < 256; code++)
-		if (key_is_down[code / 8] & (1u << (code % 8))) {
-			send_key(v, code, false);
-			n++;
-		}
-	fprintf(stderr, "bhyve-viewer: keyboard focus lost%s\n",
-	    n ? " (released held keys)" : "");
+	release_held_keys(v);
 }
 static void kbd_mods(void *d __attribute__((unused)),
     struct wl_keyboard *k __attribute__((unused)),
@@ -873,6 +883,25 @@ seat_caps(void *data, struct wl_seat *seat, uint32_t caps)
 	fprintf(stderr, "bhyve-viewer: seat caps=0x%x (keyboard=%s pointer=%s)\n",
 	    caps, (caps & WL_SEAT_CAPABILITY_KEYBOARD) ? "yes" : "no",
 	    (caps & WL_SEAT_CAPABILITY_POINTER) ? "yes" : "no");
+	/*
+	 * Capabilities come and go -- a VT switch away drops them and coming
+	 * back restores them.  Releasing on the way out is not optional: the
+	 * compositor destroys the underlying resource, so a proxy kept across
+	 * the gap is dead, and holding one means the re-add below sees a
+	 * non-NULL pointer and never rebinds.  That is a mouse that works
+	 * until the first VT switch and never again.
+	 */
+	if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && v->kbd != NULL) {
+		release_held_keys(v);	/* no leave event is coming */
+		wl_keyboard_release(v->kbd);
+		v->kbd = NULL;
+	}
+	if (!(caps & WL_SEAT_CAPABILITY_POINTER) && v->ptr != NULL) {
+		wl_pointer_release(v->ptr);
+		v->ptr = NULL;
+		ptr_buttons = 0;	/* no release event is coming either */
+	}
+
 	if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && v->kbd == NULL) {
 		v->kbd = wl_seat_get_keyboard(seat);
 		wl_keyboard_add_listener(v->kbd, &kbd_listener, v);
