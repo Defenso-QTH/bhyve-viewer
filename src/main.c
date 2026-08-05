@@ -136,6 +136,29 @@ send_msg(struct view *v, const void *msg, size_t len)
 
 static uint64_t keys_sent, ptrs_sent;
 
+/*
+ * Which evdev keys we have told the guest are down.
+ *
+ * Wayland stops delivering to a surface that loses focus, so a key pressed
+ * before the focus change never gets its release -- and the guest is left
+ * holding it.  A stuck modifier is the visible form of this, and because the
+ * emulated keyboard's state is shared by every input source it also breaks
+ * bhyve's own VNC, not just this viewer.
+ */
+static uint8_t	key_is_down[256 / 8];
+
+static void
+key_mark(uint32_t evdev, bool down)
+{
+
+	if (evdev >= 256)
+		return;
+	if (down)
+		key_is_down[evdev / 8] |= 1u << (evdev % 8);
+	else
+		key_is_down[evdev / 8] &= ~(1u << (evdev % 8));
+}
+
 static void
 send_key(struct view *v, uint32_t evdev, bool down)
 {
@@ -152,6 +175,7 @@ send_key(struct view *v, uint32_t evdev, bool down)
 	k.hdr.len = sizeof(k);
 	k.down = down ? 1 : 0;
 	k.keycode = xt;
+	key_mark(evdev, down);
 	if (!send_msg(v, &k, sizeof(k)))
 		fprintf(stderr, "bhyve-viewer: key send failed: %s\n",
 		    strerror(errno));
@@ -599,11 +623,27 @@ static void kbd_enter(void *d __attribute__((unused)),
     struct wl_surface *su __attribute__((unused)),
     struct wl_array *ks __attribute__((unused)))
 { fprintf(stderr, "bhyve-viewer: keyboard focus gained\n"); }
-static void kbd_leave(void *d __attribute__((unused)),
-    struct wl_keyboard *k __attribute__((unused)),
+static void
+kbd_leave(void *data, struct wl_keyboard *k __attribute__((unused)),
     uint32_t s __attribute__((unused)),
     struct wl_surface *su __attribute__((unused)))
-{ fprintf(stderr, "bhyve-viewer: keyboard focus lost\n"); }
+{
+	struct view *v = data;
+	unsigned n = 0;
+
+	/*
+	 * Release anything still held.  Without this a modifier pressed as
+	 * focus moves away stays down in the guest for good, and since the
+	 * emulated keyboard is shared it breaks every other input path too.
+	 */
+	for (uint32_t code = 0; code < 256; code++)
+		if (key_is_down[code / 8] & (1u << (code % 8))) {
+			send_key(v, code, false);
+			n++;
+		}
+	fprintf(stderr, "bhyve-viewer: keyboard focus lost%s\n",
+	    n ? " (released held keys)" : "");
+}
 static void kbd_mods(void *d __attribute__((unused)),
     struct wl_keyboard *k __attribute__((unused)),
     uint32_t s __attribute__((unused)), uint32_t a __attribute__((unused)),
@@ -965,6 +1005,11 @@ usage:
 				close(fence);
 		}
 	}
+
+	/* Do not leave the guest holding keys because we exited. */
+	for (uint32_t code = 0; code < 256; code++)
+		if (key_is_down[code / 8] & (1u << (code % 8)))
+			send_key(&v, code, false);
 
 	eglMakeCurrent(v.egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
 	    EGL_NO_CONTEXT);
