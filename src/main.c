@@ -66,6 +66,17 @@ static uint32_t	opt_fourcc;
 static int32_t	opt_offset = -1;
 static bool	opt_flip;
 static bool	opt_verbose;	/* -v: report every input event, not a sample */
+/*
+ * -1: display only the first scanout buffer the guest presents, ignoring
+ * flips to any other.  A diagnostic for the doubled-image problem, not a
+ * mode anyone should run: it separates "we are alternating between two
+ * buffers whose contents disagree" from "one buffer is being sampled while
+ * it is still being drawn".  If the doubling survives with a single buffer
+ * on screen, no amount of buffer bookkeeping explains it.
+ */
+static bool	opt_single;
+static uint32_t	single_id;
+static bool	have_single_id;
 
 struct buf {
 	uint32_t	id;
@@ -483,6 +494,19 @@ static void
 handle_frame(struct view *v, const struct gpu_display_frame *f, int fence_fd)
 {
 	struct buf *b = buf_find(v, f->buffer_id);
+
+	if (opt_single) {
+		if (!have_single_id) {
+			have_single_id = true;
+			single_id = f->buffer_id;
+			fprintf(stderr, "bhyve-viewer: single-buffer mode, "
+			    "showing only buffer %u\n", single_id);
+		} else if (f->buffer_id != single_id) {
+			if (fence_fd >= 0)
+				close(fence_fd);
+			return;
+		}
+	}
 
 	if (b == NULL || b->tex == 0 || !v->configured) {
 		if (fence_fd >= 0)
@@ -922,7 +946,7 @@ main(int argc, char **argv)
 	v.win_w = 1920;
 	v.win_h = 1080;
 
-	while ((c = getopt(argc, argv, "f:o:Fv")) != -1) {
+	while ((c = getopt(argc, argv, "f:o:Fv1")) != -1) {
 		switch (c) {
 		case 'f':
 			if (strlen(optarg) == 4)
@@ -942,6 +966,9 @@ main(int argc, char **argv)
 		case 'v':
 			opt_verbose = true;
 			break;
+		case '1':
+			opt_single = true;
+			break;
 		default:
 			goto usage;
 		}
@@ -955,7 +982,8 @@ usage:
 		    "  -f  four character code, e.g. XR24\n"
 		    "  -o  byte offset of plane 0\n"
 		    "  -F  flip vertically, if the image is upside down\n"
-		    "  -v  report every input event rather than a sample\n");
+		    "  -v  report every input event rather than a sample\n"
+		    "  -1  show only the first buffer (doubling diagnostic)\n");
 		return (1);
 	}
 
