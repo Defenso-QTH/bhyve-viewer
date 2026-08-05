@@ -155,6 +155,7 @@ struct view {
 	 */
 	bool		frame_ready;
 	struct wl_callback *frame_cb;
+	unsigned	cb_misses;	/* consecutive callbacks not delivered */
 	struct timespec	last_draw;
 };
 
@@ -168,6 +169,17 @@ struct view {
  * without any sign that the callbacks it was meant to follow never came.
  */
 #define	FRAME_CB_TIMEOUT_MS	17
+
+/*
+ * Once several callbacks in a row have gone missing the surface is almost
+ * certainly not visible -- switched away from, or occluded -- and drawing
+ * into it only burns host GPU on frames nobody sees.  Back off to an
+ * occasional redraw, and return to the fast path the moment a callback
+ * arrives.  This is only safe because a stale callback no longer strands the
+ * viewer here: missing callbacks now really do mean hidden.
+ */
+#define	FRAME_CB_MISSES_HIDDEN	3
+#define	FRAME_CB_HIDDEN_MS	500
 
 static long
 ms_since(const struct timespec *then)
@@ -383,6 +395,7 @@ frame_done(void *data, struct wl_callback *cb,
 	if (v->frame_cb == cb)
 		v->frame_cb = NULL;
 	v->frame_ready = true;
+	v->cb_misses = 0;		/* visible again */
 }
 
 static void
@@ -457,6 +470,7 @@ draw(struct view *v, struct buf *b, int fence_fd)
 	if (v->frame_cb != NULL) {
 		wl_callback_destroy(v->frame_cb);
 		v->frame_cb = NULL;
+		v->cb_misses++;
 		if (stale_cbs++ < 3)
 			fprintf(stderr, "bhyve-viewer: frame callback did not "
 			    "arrive, re-requesting\n");
@@ -1259,7 +1273,8 @@ usage:
 		 * surface looks like.
 		 */
 		timeout = (v.have_pending && !v.frame_ready) ?
-		    FRAME_CB_TIMEOUT_MS : -1;
+		    (v.cb_misses >= FRAME_CB_MISSES_HIDDEN ?
+		    FRAME_CB_HIDDEN_MS : FRAME_CB_TIMEOUT_MS) : -1;
 		if (v.have_pending && opt_min_frame_ms > 0)
 			timeout = 5;	/* re-check the rate cap promptly */
 
@@ -1296,7 +1311,9 @@ usage:
 		    ms_since(&v.last_draw) < opt_min_frame_ms) {
 			/* rate-capped: leave it pending, draw it later */
 		} else if (v.have_pending && (v.frame_ready ||
-		    ms_since(&v.last_draw) >= FRAME_CB_TIMEOUT_MS)) {
+		    ms_since(&v.last_draw) >=
+		    (v.cb_misses >= FRAME_CB_MISSES_HIDDEN ?
+		    FRAME_CB_HIDDEN_MS : FRAME_CB_TIMEOUT_MS))) {
 			struct buf *b = buf_find(&v, v.pending_buf);
 			int fence = v.pending_fence;
 
