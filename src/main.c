@@ -113,8 +113,12 @@ struct view {
 	 */
 	uint32_t	pending_buf;
 	bool		have_pending;
+	int		pending_fence;	/* sync_file for that buffer, or -1 */
 };
 
+static PFNEGLCREATESYNCKHRPROC		p_eglCreateSyncKHR;
+static PFNEGLDESTROYSYNCKHRPROC		p_eglDestroySyncKHR;
+static PFNEGLWAITSYNCKHRPROC		p_eglWaitSyncKHR;
 static PFNEGLCREATEIMAGEKHRPROC		p_eglCreateImageKHR;
 static PFNEGLDESTROYIMAGEKHRPROC	p_eglDestroyImageKHR;
 static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC p_glEGLImageTargetTexture2DOES;
@@ -258,12 +262,37 @@ gl_setup(struct view *v)
 }
 
 static void
-draw(struct view *v, struct buf *b)
+draw(struct view *v, struct buf *b, int fence_fd)
 {
 	static const GLfloat quad[] = {
 		-1.f, -1.f,  1.f, -1.f, -1.f, 1.f,
 		 1.f, -1.f,  1.f,  1.f, -1.f, 1.f,
 	};
+
+	/*
+	 * Make the GPU wait until the guest has finished drawing into this
+	 * buffer.  eglWaitSyncKHR queues the wait on the GL command stream
+	 * rather than blocking here, so the cost is ordering, not a stall.
+	 * Without it we sample whatever is in the buffer at the moment we
+	 * happen to read it, which on a fast renderer is part of one frame
+	 * and part of the next.
+	 */
+	if (fence_fd >= 0 && p_eglCreateSyncKHR != NULL) {
+		EGLint attrs[] = {
+			EGL_SYNC_NATIVE_FENCE_FD_ANDROID, fence_fd, EGL_NONE
+		};
+		EGLSyncKHR sync = p_eglCreateSyncKHR(v->egl_dpy,
+		    EGL_SYNC_NATIVE_FENCE_ANDROID, attrs);
+
+		if (sync != EGL_NO_SYNC_KHR) {
+			/* eglCreateSyncKHR took the fd. */
+			p_eglWaitSyncKHR(v->egl_dpy, sync, 0);
+			p_eglDestroySyncKHR(v->egl_dpy, sync);
+		} else {
+			close(fence_fd);
+		}
+	} else if (fence_fd >= 0)
+		close(fence_fd);
 
 	glViewport(0, 0, v->win_w, v->win_h);
 	glUseProgram(v->prog);
@@ -390,14 +419,24 @@ handle_scanout(struct view *v, const struct gpu_display_scanout *so, int fd)
 }
 
 static void
-handle_frame(struct view *v, const struct gpu_display_frame *f)
+handle_frame(struct view *v, const struct gpu_display_frame *f, int fence_fd)
 {
 	struct buf *b = buf_find(v, f->buffer_id);
 
-	if (b == NULL || b->tex == 0 || !v->configured)
+	if (b == NULL || b->tex == 0 || !v->configured) {
+		if (fence_fd >= 0)
+			close(fence_fd);
 		return;
-	/* Coalesce: only the most recent flip is worth drawing. */
+	}
+	/*
+	 * Coalesce: only the most recent flip is worth drawing, and only its
+	 * fence matters -- a superseded frame's fence guards a buffer we are
+	 * no longer going to read.
+	 */
+	if (v->pending_fence >= 0)
+		close(v->pending_fence);
 	v->pending_buf = f->buffer_id;
+	v->pending_fence = fence_fd;
 	v->have_pending = true;
 }
 
@@ -461,9 +500,14 @@ sock_readable(struct view *v)
 			handle_scanout(v, (const void *)v->inbuf, fd);
 			fd = -1;
 			break;
-		case GPU_DISPLAY_MSG_FRAME:
-			handle_frame(v, (const void *)v->inbuf);
+		case GPU_DISPLAY_MSG_FRAME: {
+			const struct gpu_display_frame *f = (const void *)v->inbuf;
+
+			handle_frame(v, f, f->has_fence ? fd : -1);
+			if (f->has_fence)
+				fd = -1;	/* consumed */
 			break;
+		}
 		case GPU_DISPLAY_MSG_UNBIND:
 			for (int i = 0; i < MAX_BUFS; i++)
 				if (v->bufs[i].used)
@@ -720,6 +764,12 @@ egl_setup(struct view *v)
 		return (false);
 	}
 
+	p_eglCreateSyncKHR = (void *)eglGetProcAddress("eglCreateSyncKHR");
+	p_eglDestroySyncKHR = (void *)eglGetProcAddress("eglDestroySyncKHR");
+	p_eglWaitSyncKHR = (void *)eglGetProcAddress("eglWaitSyncKHR");
+	if (p_eglCreateSyncKHR == NULL || p_eglWaitSyncKHR == NULL)
+		fprintf(stderr, "bhyve-viewer: no EGL_ANDROID_native_fence_sync;"
+		    " frames will not be synchronised with the guest\n");
 	p_eglCreateImageKHR = (void *)eglGetProcAddress("eglCreateImageKHR");
 	p_eglDestroyImageKHR = (void *)eglGetProcAddress("eglDestroyImageKHR");
 	p_glEGLImageTargetTexture2DOES =
@@ -767,6 +817,7 @@ main(int argc, char **argv)
 
 	memset(&v, 0, sizeof(v));
 	v.running = true;
+	v.pending_fence = -1;
 	v.win_w = 1920;
 	v.win_h = 1080;
 
@@ -904,10 +955,14 @@ usage:
 
 		if (v.have_pending) {
 			struct buf *b = buf_find(&v, v.pending_buf);
+			int fence = v.pending_fence;
 
 			v.have_pending = false;
+			v.pending_fence = -1;
 			if (b != NULL && b->tex != 0)
-				draw(&v, b);
+				draw(&v, b, fence);
+			else if (fence >= 0)
+				close(fence);
 		}
 	}
 
