@@ -122,20 +122,30 @@ send_msg(struct view *v, const void *msg, size_t len)
 	return (write(v->sock, msg, len) == (ssize_t)len);
 }
 
+static uint64_t keys_sent, ptrs_sent;
+
 static void
 send_key(struct view *v, uint32_t evdev, bool down)
 {
 	struct gpu_display_key k;
 	uint32_t xt = evdev_to_xt(evdev);
 
-	if (xt == 0)
+	if (xt == 0) {
+		fprintf(stderr, "bhyve-viewer: key evdev=%u has no XT mapping, "
+		    "dropped\n", evdev);
 		return;
+	}
 	memset(&k, 0, sizeof(k));
 	k.hdr.type = GPU_DISPLAY_MSG_KEY;
 	k.hdr.len = sizeof(k);
 	k.down = down ? 1 : 0;
 	k.keycode = xt;
-	(void)send_msg(v, &k, sizeof(k));
+	if (!send_msg(v, &k, sizeof(k)))
+		fprintf(stderr, "bhyve-viewer: key send failed: %s\n",
+		    strerror(errno));
+	else if (keys_sent++ < 5)
+		fprintf(stderr, "bhyve-viewer: sent key evdev=%u xt=0x%x %s\n",
+		    evdev, xt, down ? "down" : "up");
 }
 
 static void
@@ -159,7 +169,12 @@ send_ptr(struct view *v, uint32_t buttons, int32_t x, int32_t y)
 		p.x = x;
 		p.y = y;
 	}
-	(void)send_msg(v, &p, sizeof(p));
+	if (!send_msg(v, &p, sizeof(p)))
+		fprintf(stderr, "bhyve-viewer: ptr send failed: %s\n",
+		    strerror(errno));
+	else if (ptrs_sent++ < 5)
+		fprintf(stderr, "bhyve-viewer: sent ptr buttons=0x%x %d,%d\n",
+		    buttons, p.x, p.y);
 }
 
 /* ------------------------------------------------------------------ */
@@ -528,11 +543,13 @@ static void kbd_enter(void *d __attribute__((unused)),
     struct wl_keyboard *k __attribute__((unused)),
     uint32_t s __attribute__((unused)),
     struct wl_surface *su __attribute__((unused)),
-    struct wl_array *ks __attribute__((unused))) {}
+    struct wl_array *ks __attribute__((unused)))
+{ fprintf(stderr, "bhyve-viewer: keyboard focus gained\n"); }
 static void kbd_leave(void *d __attribute__((unused)),
     struct wl_keyboard *k __attribute__((unused)),
     uint32_t s __attribute__((unused)),
-    struct wl_surface *su __attribute__((unused))) {}
+    struct wl_surface *su __attribute__((unused)))
+{ fprintf(stderr, "bhyve-viewer: keyboard focus lost\n"); }
 static void kbd_mods(void *d __attribute__((unused)),
     struct wl_keyboard *k __attribute__((unused)),
     uint32_t s __attribute__((unused)), uint32_t a __attribute__((unused)),
@@ -582,7 +599,8 @@ static void ptr_enter(void *d __attribute__((unused)),
     uint32_t s __attribute__((unused)),
     struct wl_surface *su __attribute__((unused)),
     wl_fixed_t x __attribute__((unused)),
-    wl_fixed_t y __attribute__((unused))) {}
+    wl_fixed_t y __attribute__((unused)))
+{ fprintf(stderr, "bhyve-viewer: pointer entered\n"); }
 static void ptr_leave(void *d __attribute__((unused)),
     struct wl_pointer *p __attribute__((unused)),
     uint32_t s __attribute__((unused)),
@@ -615,6 +633,9 @@ seat_caps(void *data, struct wl_seat *seat, uint32_t caps)
 {
 	struct view *v = data;
 
+	fprintf(stderr, "bhyve-viewer: seat caps=0x%x (keyboard=%s pointer=%s)\n",
+	    caps, (caps & WL_SEAT_CAPABILITY_KEYBOARD) ? "yes" : "no",
+	    (caps & WL_SEAT_CAPABILITY_POINTER) ? "yes" : "no");
 	if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && v->kbd == NULL) {
 		v->kbd = wl_seat_get_keyboard(seat);
 		wl_keyboard_add_listener(v->kbd, &kbd_listener, v);
