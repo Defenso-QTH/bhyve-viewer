@@ -77,6 +77,16 @@ static bool	opt_verbose;	/* -v: report every input event, not a sample */
  */
 static bool	opt_single;
 /*
+ * -H: hide the host compositor's cursor over our surface.
+ *
+ * We never set a cursor, so the compositor draws its default one -- which is
+ * indistinguishable at a glance from a guest cursor composited into the
+ * scanout.  Hiding ours settles the question: whatever is left is the
+ * guest's.  Until the cursor plane is forwarded, expect no pointer at all
+ * wherever the guest relies on hardware cursor.
+ */
+static bool	opt_hide_cursor;
+/*
  * -r: cap the draw rate.  At a few frames a second the eye cannot merge
  * successive frames, so a smoothly stepping cube means each frame is fine and
  * the artefact is in which frame is shown when; a cube that still looks
@@ -938,11 +948,17 @@ ptr_button(void *data, struct wl_pointer *p __attribute__((unused)),
  * enter carries a position, and it is the only one we get if the pointer is
  * warped into the surface and clicked without moving.
  */
-static void ptr_enter(void *d, struct wl_pointer *p __attribute__((unused)),
-    uint32_t s __attribute__((unused)),
-    struct wl_surface *su __attribute__((unused)),
+static void ptr_enter(void *d, struct wl_pointer *p,
+    uint32_t serial, struct wl_surface *su __attribute__((unused)),
     wl_fixed_t x, wl_fixed_t y)
 {
+	/*
+	 * The cursor has to be set on every enter: the compositor resets it to
+	 * its default whenever the pointer crosses into the surface.
+	 */
+	if (opt_hide_cursor)
+		wl_pointer_set_cursor(p, serial, NULL, 0, 0);
+
 	ptr_x = wl_fixed_to_int(x);
 	ptr_y = wl_fixed_to_int(y);
 	send_ptr(d, ptr_buttons, ptr_x, ptr_y);
@@ -1167,7 +1183,7 @@ main(int argc, char **argv)
 	v.win_w = 1920;
 	v.win_h = 1080;
 
-	while ((c = getopt(argc, argv, "f:o:Fv1r:")) != -1) {
+	while ((c = getopt(argc, argv, "f:o:Fv1r:H")) != -1) {
 		switch (c) {
 		case 'f':
 			if (strlen(optarg) == 4)
@@ -1189,6 +1205,9 @@ main(int argc, char **argv)
 			break;
 		case '1':
 			opt_single = true;
+			break;
+		case 'H':
+			opt_hide_cursor = true;
 			break;
 		case 'r': {
 			int fps = atoi(optarg);
@@ -1212,7 +1231,8 @@ usage:
 		    "  -F  flip vertically, if the image is upside down\n"
 		    "  -v  report every input event rather than a sample\n"
 		    "  -1  show only the first buffer (doubling diagnostic)\n"
-		    "  -r  cap the draw rate, in frames per second\n");
+		    "  -r  cap the draw rate, in frames per second\n"
+		    "  -H  hide the host cursor (what is left is the guest's)\n");
 		return (1);
 	}
 
