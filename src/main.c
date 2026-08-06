@@ -30,8 +30,11 @@
  * Wayland, and this can be jailed with nothing but the socket.
  */
 
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+
+#include <fcntl.h>
 
 #include <errno.h>
 #include <poll.h>
@@ -121,6 +124,7 @@ struct view {
 	struct wl_registry	*registry;
 	struct wl_compositor	*compositor;
 	struct xdg_wm_base	*wm_base;
+	struct wl_shm		*shm;
 	struct wl_seat		*seat;
 	struct wl_keyboard	*kbd;
 	struct wl_pointer	*ptr;
@@ -166,6 +170,20 @@ struct view {
 	bool		frame_ready;
 	struct wl_callback *frame_cb;
 	unsigned	cb_misses;	/* consecutive callbacks not delivered */
+
+	/*
+	 * The guest's hardware cursor, handed to the compositor rather than
+	 * composited by us.  The viewer's pointer maps onto the guest's one to
+	 * one, so the compositor already knows where the cursor belongs and
+	 * draws it with no round trip through the guest -- which also means it
+	 * keeps moving smoothly while the guest is busy.
+	 */
+	struct wl_surface	*cursor_surface;
+	struct wl_buffer	*cursor_buffer;
+	uint32_t		cursor_hot_x, cursor_hot_y;
+	bool			have_cursor;
+	bool			cursor_hidden;
+	uint32_t		ptr_serial;	/* latest pointer enter */
 	struct timespec	last_draw;
 };
 
@@ -200,6 +218,10 @@ ms_since(const struct timespec *then)
 	return ((now.tv_sec - then->tv_sec) * 1000 +
 	    (now.tv_nsec - then->tv_nsec) / 1000000);
 }
+
+static void	apply_cursor(struct view *v);
+static void	handle_cursor(struct view *v,
+		    const struct gpu_display_cursor *c, size_t len);
 
 static PFNEGLCREATESYNCKHRPROC		p_eglCreateSyncKHR;
 static PFNEGLDESTROYSYNCKHRPROC		p_eglDestroySyncKHR;
@@ -769,6 +791,9 @@ sock_readable(struct view *v)
 				fd = -1;	/* consumed */
 			break;
 		}
+		case GPU_DISPLAY_MSG_CURSOR:
+			handle_cursor(v, (const void *)v->inbuf, hdr.len);
+			break;
 		case GPU_DISPLAY_MSG_UNBIND:
 			for (int i = 0; i < MAX_BUFS; i++)
 				if (v->bufs[i].used)
@@ -948,7 +973,7 @@ ptr_button(void *data, struct wl_pointer *p __attribute__((unused)),
  * enter carries a position, and it is the only one we get if the pointer is
  * warped into the surface and clicked without moving.
  */
-static void ptr_enter(void *d, struct wl_pointer *p,
+static void ptr_enter(void *d, struct wl_pointer *p __attribute__((unused)),
     uint32_t serial, struct wl_surface *su __attribute__((unused)),
     wl_fixed_t x, wl_fixed_t y)
 {
@@ -956,8 +981,8 @@ static void ptr_enter(void *d, struct wl_pointer *p,
 	 * The cursor has to be set on every enter: the compositor resets it to
 	 * its default whenever the pointer crosses into the surface.
 	 */
-	if (opt_hide_cursor)
-		wl_pointer_set_cursor(p, serial, NULL, 0, 0);
+	((struct view *)d)->ptr_serial = serial;
+	apply_cursor(d);
 
 	ptr_x = wl_fixed_to_int(x);
 	ptr_y = wl_fixed_to_int(y);
@@ -967,6 +992,100 @@ static void ptr_leave(void *d __attribute__((unused)),
     struct wl_pointer *p __attribute__((unused)),
     uint32_t s __attribute__((unused)),
     struct wl_surface *su __attribute__((unused))) {}
+/*
+ * Give the compositor the guest's cursor image, or hide the pointer.
+ *
+ * Re-applied on every pointer enter as well as on every change: the
+ * compositor resets the cursor to its default each time the pointer crosses
+ * into the surface, so setting it once is not enough.
+ */
+static void
+apply_cursor(struct view *v)
+{
+
+	if (v->ptr == NULL || v->ptr_serial == 0)
+		return;
+	if (v->cursor_hidden)
+		wl_pointer_set_cursor(v->ptr, v->ptr_serial, NULL, 0, 0);
+	else if (v->have_cursor && v->cursor_surface != NULL)
+		wl_pointer_set_cursor(v->ptr, v->ptr_serial, v->cursor_surface,
+		    (int32_t)v->cursor_hot_x, (int32_t)v->cursor_hot_y);
+	else if (opt_hide_cursor)
+		wl_pointer_set_cursor(v->ptr, v->ptr_serial, NULL, 0, 0);
+}
+
+static void
+handle_cursor(struct view *v, const struct gpu_display_cursor *c, size_t len)
+{
+	size_t bytes = (size_t)c->width * c->height * 4;
+	struct wl_shm_pool *pool;
+	void *map;
+	int fd;
+
+	if (c->hidden) {
+		v->cursor_hidden = true;
+		v->have_cursor = false;
+		apply_cursor(v);
+		return;
+	}
+	v->cursor_hidden = false;
+
+	if (v->shm == NULL || c->width == 0 || c->height == 0 ||
+	    len < sizeof(*c) + bytes)
+		return;
+
+	/*
+	 * A fresh buffer each time.  Cursors change a few times a second at
+	 * most -- on shape changes, not on movement -- so reusing one is not
+	 * worth having to know when the compositor has finished with it.
+	 */
+	if ((fd = shm_open(SHM_ANON, O_RDWR | O_CREAT, 0600)) < 0)
+		return;
+	if (ftruncate(fd, (off_t)bytes) != 0) {
+		close(fd);
+		return;
+	}
+	map = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (map == MAP_FAILED) {
+		close(fd);
+		return;
+	}
+	memcpy(map, (const uint8_t *)c + sizeof(*c), bytes);
+	munmap(map, bytes);
+
+	pool = wl_shm_create_pool(v->shm, fd, (int32_t)bytes);
+	close(fd);
+	if (pool == NULL)
+		return;
+
+	if (v->cursor_buffer != NULL)
+		wl_buffer_destroy(v->cursor_buffer);
+	v->cursor_buffer = wl_shm_pool_create_buffer(pool, 0,
+	    (int32_t)c->width, (int32_t)c->height, (int32_t)(c->width * 4),
+	    WL_SHM_FORMAT_ARGB8888);
+	wl_shm_pool_destroy(pool);
+	if (v->cursor_buffer == NULL)
+		return;
+
+	if (v->cursor_surface == NULL)
+		v->cursor_surface = wl_compositor_create_surface(v->compositor);
+	if (v->cursor_surface == NULL)
+		return;
+
+	wl_surface_attach(v->cursor_surface, v->cursor_buffer, 0, 0);
+	wl_surface_damage(v->cursor_surface, 0, 0, (int32_t)c->width,
+	    (int32_t)c->height);
+	wl_surface_commit(v->cursor_surface);
+
+	v->cursor_hot_x = c->hot_x;
+	v->cursor_hot_y = c->hot_y;
+	if (!v->have_cursor)
+		fprintf(stderr, "bhyve-viewer: guest cursor %ux%u hot=%u,%u\n",
+		    c->width, c->height, c->hot_x, c->hot_y);
+	v->have_cursor = true;
+	apply_cursor(v);
+}
+
 /*
  * Scroll wheel.  bhyve's tablet carries it in the button mask rather than as
  * an axis: umouse_event() reads 0x08 as one detent up and 0x10 as one down
@@ -1078,6 +1197,8 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name,
 	if (strcmp(iface, wl_compositor_interface.name) == 0)
 		v->compositor = wl_registry_bind(reg, name,
 		    &wl_compositor_interface, 4);
+	else if (strcmp(iface, wl_shm_interface.name) == 0)
+		v->shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
 	else if (strcmp(iface, xdg_wm_base_interface.name) == 0) {
 		v->wm_base = wl_registry_bind(reg, name,
 		    &xdg_wm_base_interface, 1);
