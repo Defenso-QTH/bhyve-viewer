@@ -951,10 +951,44 @@ static void ptr_leave(void *d __attribute__((unused)),
     struct wl_pointer *p __attribute__((unused)),
     uint32_t s __attribute__((unused)),
     struct wl_surface *su __attribute__((unused))) {}
-static void ptr_axis(void *d __attribute__((unused)),
-    struct wl_pointer *p __attribute__((unused)),
-    uint32_t t __attribute__((unused)), uint32_t a __attribute__((unused)),
-    wl_fixed_t val __attribute__((unused))) {}
+/*
+ * Scroll wheel.  bhyve's tablet carries it in the button mask rather than as
+ * an axis: umouse_event() reads 0x08 as one detent up and 0x10 as one down
+ * (usb_mouse.c, um_report.z).  A detent is therefore a press and a release,
+ * like a button, not a value.
+ *
+ * Wayland reports scrolling as a continuous distance in surface units, so
+ * accumulate and emit one detent per wl_pointer's ten-unit step; a touchpad
+ * sending fine-grained deltas then still scrolls at a sensible rate rather
+ * than firing on every fraction.
+ */
+#define	AXIS_STEP	10.0
+
+static void
+ptr_axis(void *data, struct wl_pointer *p __attribute__((unused)),
+    uint32_t t __attribute__((unused)), uint32_t axis, wl_fixed_t val)
+{
+	static double accum;
+	struct view *v = data;
+	double d = wl_fixed_to_double(val);
+	uint32_t bit;
+
+	if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
+		return;		/* horizontal has nowhere to go */
+
+	accum += d;
+	while (accum >= AXIS_STEP || accum <= -AXIS_STEP) {
+		if (accum >= AXIS_STEP) {
+			bit = 0x10;		/* positive is down */
+			accum -= AXIS_STEP;
+		} else {
+			bit = 0x08;		/* negative is up */
+			accum += AXIS_STEP;
+		}
+		send_ptr(v, ptr_buttons | bit, ptr_x, ptr_y);
+		send_ptr(v, ptr_buttons, ptr_x, ptr_y);
+	}
+}
 static void ptr_frame(void *d __attribute__((unused)),
     struct wl_pointer *p __attribute__((unused))) {}
 static void ptr_asrc(void *d __attribute__((unused)),
