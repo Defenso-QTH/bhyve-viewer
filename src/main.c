@@ -169,7 +169,8 @@ struct view {
 	 */
 	bool		frame_ready;
 	struct wl_callback *frame_cb;
-	unsigned	cb_misses;	/* consecutive callbacks not delivered */
+	struct timespec	last_cb;	/* when a frame callback last arrived */
+	bool		had_cb;		/* ... and whether one ever has */
 
 	/*
 	 * The guest's hardware cursor, handed to the compositor rather than
@@ -206,7 +207,20 @@ struct view {
  * arrives.  This is only safe because a stale callback no longer strands the
  * viewer here: missing callbacks now really do mean hidden.
  */
-#define	FRAME_CB_MISSES_HIDDEN	3
+/*
+ * How long the compositor must go without delivering a frame callback before
+ * we conclude the surface is not visible.
+ *
+ * This was a count of missed 17ms deadlines, three of them -- so 51ms of
+ * lateness was read as "hidden" and dropped us to 2fps.  A compositor whose
+ * GPU is saturated is routinely later than that, and here the thing
+ * saturating it is the guest we are displaying: the busier the game, the more
+ * likely we throttled ourselves to a slideshow.  Measured 20 frames presented
+ * against 1 drawn.
+ *
+ * A second of complete silence means hidden.  Being late does not.
+ */
+#define	FRAME_CB_HIDDEN_AFTER_MS	1000
 #define	FRAME_CB_HIDDEN_MS	500
 
 static long
@@ -427,7 +441,20 @@ frame_done(void *data, struct wl_callback *cb,
 	if (v->frame_cb == cb)
 		v->frame_cb = NULL;
 	v->frame_ready = true;
-	v->cb_misses = 0;		/* visible again */
+	clock_gettime(CLOCK_MONOTONIC, &v->last_cb);
+	v->had_cb = true;
+}
+
+/*
+ * Not visible, as opposed to merely slow.  Until the compositor has delivered
+ * one callback we have nothing to measure from, so assume visible.
+ */
+static bool
+surface_hidden(struct view *v)
+{
+
+	return (v->had_cb &&
+	    ms_since(&v->last_cb) >= FRAME_CB_HIDDEN_AFTER_MS);
 }
 
 static void
@@ -502,7 +529,6 @@ draw(struct view *v, struct buf *b, int fence_fd)
 	if (v->frame_cb != NULL) {
 		wl_callback_destroy(v->frame_cb);
 		v->frame_cb = NULL;
-		v->cb_misses++;
 		if (stale_cbs++ < 3)
 			fprintf(stderr, "bhyve-viewer: frame callback did not "
 			    "arrive, re-requesting\n");
@@ -1448,8 +1474,8 @@ usage:
 		 * surface looks like.
 		 */
 		timeout = (v.have_pending && !v.frame_ready) ?
-		    (v.cb_misses >= FRAME_CB_MISSES_HIDDEN ?
-		    FRAME_CB_HIDDEN_MS : FRAME_CB_TIMEOUT_MS) : -1;
+		    (surface_hidden(&v) ? FRAME_CB_HIDDEN_MS :
+		    FRAME_CB_TIMEOUT_MS) : -1;
 		if (v.have_pending && opt_min_frame_ms > 0)
 			timeout = 5;	/* re-check the rate cap promptly */
 
@@ -1486,8 +1512,7 @@ usage:
 		    ms_since(&v.last_draw) < opt_min_frame_ms) {
 			/* rate-capped: leave it pending, draw it later */
 		} else if (v.have_pending && (v.frame_ready ||
-		    ms_since(&v.last_draw) >=
-		    (v.cb_misses >= FRAME_CB_MISSES_HIDDEN ?
+		    ms_since(&v.last_draw) >= (surface_hidden(&v) ?
 		    FRAME_CB_HIDDEN_MS : FRAME_CB_TIMEOUT_MS))) {
 			struct buf *b = buf_find(&v, v.pending_buf);
 			int fence = v.pending_fence;
