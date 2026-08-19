@@ -55,6 +55,8 @@
 #include <GLES2/gl2ext.h>
 
 #include "gpu_display.h"
+
+#define	NELEM(a)	(sizeof(a) / sizeof((a)[0]))
 #include "keymap.h"
 #include "xdg-shell-client-protocol.h"
 
@@ -103,6 +105,37 @@ static uintmax_t	evictions;
 static uintmax_t	stale_cbs;
 static uint64_t		draw_seq;
 static struct timespec	stat_since;
+
+/*
+ * Diagnostics for "the image flickers several times a second", which is a
+ * per-frame fault rather than a pacing one: at 60fps, once every ten or
+ * twenty frames something is wrong with the frame we drew.  Two candidates
+ * are distinguishable from here.  Sampling whatever is in the buffer while
+ * the guest is still rendering into it needs a missing or unwaited fence, so
+ * every frame is counted as fenced, unfenced, or fenced-but-unusable.  A
+ * buffer being recycled underneath us shows up in which buffer ids are drawn
+ * and in how often a slot is imported or evicted.
+ *
+ * These are totals for the interval, never samples: three earlier bugs in
+ * this file were hidden by log lines that stopped after the first few
+ * events, so the summary reports counts and the per-frame trace is opt-in
+ * and says when it truncates.
+ */
+static uintmax_t	stat_superseded;	/* coalesced away undrawn */
+static uintmax_t	stat_nofence;		/* arrived without a fence */
+static uintmax_t	stat_fenced;		/* fence waited on */
+static uintmax_t	stat_fence_failed;	/* fence arrived, unusable */
+static uintmax_t	stat_imports;		/* dma_bufs imported */
+static uintmax_t	stat_redraw_same;	/* same buffer twice running */
+static uint32_t		stat_last_drawn_id;
+static bool		stat_have_last_id;
+static uint32_t		stat_ids[8];		/* distinct ids drawn */
+static unsigned		stat_nids;
+/* Inter-draw interval, bucketed: <8, 8-12, 12-20, 20-33, 33-50, >50 ms. */
+static uintmax_t	stat_dt[6];
+static struct timespec	stat_last_draw;
+static bool		opt_trace;	/* -T: one line per drawn frame */
+static uintmax_t	trace_left;
 static uint32_t	single_id;
 static bool	have_single_id;
 
@@ -489,11 +522,13 @@ draw(struct view *v, struct buf *b, int fence_fd)
 				fprintf(stderr, "bhyve-viewer: waited on "
 				    "fence #%ju\n", (uintmax_t)waits + 1);
 			waits++;
+			stat_fenced++;
 		} else {
 			fprintf(stderr, "bhyve-viewer: eglCreateSyncKHR "
 			    "failed (0x%x); drawing unsynchronised\n",
 			    eglGetError());
 			close(fence_fd);
+			stat_fence_failed++;
 		}
 	} else if (fence_fd >= 0) {
 		static bool warned;
@@ -504,6 +539,52 @@ draw(struct view *v, struct buf *b, int fence_fd)
 			    "EGL sync support; drawing unsynchronised\n");
 		}
 		close(fence_fd);
+		stat_fence_failed++;
+	}
+
+	/*
+	 * Record what we are about to draw.  Which buffer, how long since the
+	 * last draw, and whether this frame was synchronised at all: a flicker
+	 * that lands on unfenced frames, on a particular buffer id, or right
+	 * after an import is three different bugs.
+	 */
+	{
+		struct timespec now;
+		double dt = -1.0;
+		unsigned i;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (stat_last_draw.tv_sec != 0) {
+			dt = (double)(now.tv_sec - stat_last_draw.tv_sec) * 1e3 +
+			    (double)(now.tv_nsec - stat_last_draw.tv_nsec) / 1e6;
+			stat_dt[dt < 8.0 ? 0 : dt < 12.0 ? 1 : dt < 20.0 ? 2 :
+			    dt < 33.0 ? 3 : dt < 50.0 ? 4 : 5]++;
+		}
+		stat_last_draw = now;
+
+		if (stat_have_last_id && stat_last_drawn_id == b->id)
+			stat_redraw_same++;
+		stat_last_drawn_id = b->id;
+		stat_have_last_id = true;
+
+		for (i = 0; i < stat_nids; i++)
+			if (stat_ids[i] == b->id)
+				break;
+		if (i == stat_nids && stat_nids < NELEM(stat_ids))
+			stat_ids[stat_nids++] = b->id;
+
+		if (opt_trace) {
+			if (trace_left > 0) {
+				fprintf(stderr, "bhyve-viewer: trace seq=%ju "
+				    "buf=%u fence=%s dt=%.2fms\n",
+				    (uintmax_t)draw_seq, b->id,
+				    fence_fd >= 0 ? "yes" : "NO", dt);
+				if (--trace_left == 0)
+					fprintf(stderr, "bhyve-viewer: trace "
+					    "budget spent, further frames not "
+					    "logged (counts stay complete)\n");
+			}
+		}
 	}
 
 	glViewport(0, 0, v->win_w, v->win_h);
@@ -669,6 +750,7 @@ handle_scanout(struct view *v, const struct gpu_display_scanout *so, int fd)
 	    GL_CLAMP_TO_EDGE);
 	p_glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, b->image);
 
+	stat_imports++;
 	b->id = so->buffer_id;
 	b->width = so->width;
 	b->height = so->height;
@@ -710,6 +792,8 @@ handle_frame(struct view *v, const struct gpu_display_frame *f, int fence_fd)
 	 */
 	if (v->pending_fence >= 0)
 		close(v->pending_fence);
+	if (v->have_pending)
+		stat_superseded++;
 	v->pending_buf = f->buffer_id;
 	v->pending_fence = fence_fd;
 	v->have_pending = true;
@@ -736,7 +820,37 @@ stats_tick(void)
 	fprintf(stderr, "bhyve-viewer: guest presented %ju frames/s, drew "
 	    "%ju/s\n", stat_frames_in * 1000 / (uintmax_t)ms,
 	    stat_frames_drawn * 1000 / (uintmax_t)ms);
+
+	/*
+	 * Totals for the interval, not rates: a flicker several times a second
+	 * is a handful of frames out of sixty, and dividing that by the
+	 * interval rounds it away.
+	 */
+	fprintf(stderr, "bhyve-viewer: %ldms in=%ju drawn=%ju superseded=%ju | "
+	    "fence: ok=%ju none=%ju unusable=%ju | bufs: ids=%u redraw=%ju "
+	    "imports=%ju evict=%ju | dt<8=%ju 8-12=%ju 12-20=%ju 20-33=%ju "
+	    "33-50=%ju >50=%ju\n",
+	    ms, stat_frames_in, stat_frames_drawn, stat_superseded,
+	    stat_fenced, stat_nofence, stat_fence_failed,
+	    stat_nids, stat_redraw_same, stat_imports, evictions,
+	    stat_dt[0], stat_dt[1], stat_dt[2], stat_dt[3], stat_dt[4],
+	    stat_dt[5]);
+
+	if (stat_nids > 0) {
+		unsigned i;
+
+		fprintf(stderr, "bhyve-viewer:   buffer ids drawn:");
+		for (i = 0; i < stat_nids; i++)
+			fprintf(stderr, " %u", stat_ids[i]);
+		fprintf(stderr, "%s\n",
+		    stat_nids == NELEM(stat_ids) ? " (list full)" : "");
+	}
+
 	stat_frames_in = stat_frames_drawn = 0;
+	stat_superseded = stat_nofence = stat_fenced = stat_fence_failed = 0;
+	stat_imports = stat_redraw_same = evictions = 0;
+	memset(stat_dt, 0, sizeof(stat_dt));
+	stat_nids = 0;
 	clock_gettime(CLOCK_MONOTONIC, &stat_since);
 }
 
@@ -805,6 +919,8 @@ sock_readable(struct view *v)
 
 			if (!f->has_fence) {
 				static uintmax_t unfenced;
+
+				stat_nofence++;
 
 				if (unfenced < 3)
 					fprintf(stderr, "bhyve-viewer: frame "
@@ -1330,7 +1446,7 @@ main(int argc, char **argv)
 	v.win_w = 1920;
 	v.win_h = 1080;
 
-	while ((c = getopt(argc, argv, "f:o:Fv1r:H")) != -1) {
+	while ((c = getopt(argc, argv, "f:o:Fv1r:HT:")) != -1) {
 		switch (c) {
 		case 'f':
 			if (strlen(optarg) == 4)
@@ -1356,6 +1472,15 @@ main(int argc, char **argv)
 		case 'H':
 			opt_hide_cursor = true;
 			break;
+		case 'T': {
+			long n = strtol(optarg, NULL, 0);
+
+			if (n > 0) {
+				opt_trace = true;
+				trace_left = (uintmax_t)n;
+			}
+			break;
+		}
 		case 'r': {
 			int fps = atoi(optarg);
 
@@ -1379,7 +1504,9 @@ usage:
 		    "  -v  report every input event rather than a sample\n"
 		    "  -1  show only the first buffer (doubling diagnostic)\n"
 		    "  -r  cap the draw rate, in frames per second\n"
-		    "  -H  hide the host cursor (what is left is the guest's)\n");
+		    "  -H  hide the host cursor (what is left is the guest's)\n"
+		    "  -T  trace the next N drawn frames: buffer, fence, "
+		    "interval\n");
 		return (1);
 	}
 
