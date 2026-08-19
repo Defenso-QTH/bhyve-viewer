@@ -131,9 +131,22 @@ static uint32_t		stat_last_drawn_id;
 static bool		stat_have_last_id;
 static uint32_t		stat_ids[8];		/* distinct ids drawn */
 static unsigned		stat_nids;
-/* Inter-draw interval, bucketed: <8, 8-12, 12-20, 20-33, 33-50, >50 ms. */
+/*
+ * Interval between frames, bucketed: <8, 8-12, 12-20, 20-33, 33-50, >50 ms.
+ * Measured twice: when a frame arrives from bhyve, and when we draw one.
+ * Even arrivals with lumpy draws puts the stall on this side of the socket
+ * -- the compositor, the swap, or our own event loop.  Lumpy arrivals put it
+ * upstream, in bhyve or the guest.  Without both, a stall is unattributable.
+ */
 static uintmax_t	stat_dt[6];
+static uintmax_t	stat_arr_dt[6];
 static struct timespec	stat_last_draw;
+static struct timespec	stat_last_arrival;
+static double		stat_last_arrival_dt = -1.0;
+
+#define	DT_BUCKET(ms)	((ms) < 8.0 ? 0 : (ms) < 12.0 ? 1 : (ms) < 20.0 ? 2 : \
+			 (ms) < 33.0 ? 3 : (ms) < 50.0 ? 4 : 5)
+#define	TRACE_LATE_MS	25.0	/* only late frames are worth a line */
 static bool		opt_trace;	/* -T: one line per drawn frame */
 static uintmax_t	trace_left;
 static uint32_t	single_id;
@@ -557,8 +570,7 @@ draw(struct view *v, struct buf *b, int fence_fd)
 		if (stat_last_draw.tv_sec != 0) {
 			dt = (double)(now.tv_sec - stat_last_draw.tv_sec) * 1e3 +
 			    (double)(now.tv_nsec - stat_last_draw.tv_nsec) / 1e6;
-			stat_dt[dt < 8.0 ? 0 : dt < 12.0 ? 1 : dt < 20.0 ? 2 :
-			    dt < 33.0 ? 3 : dt < 50.0 ? 4 : 5]++;
+			stat_dt[DT_BUCKET(dt)]++;
 		}
 		stat_last_draw = now;
 
@@ -573,12 +585,14 @@ draw(struct view *v, struct buf *b, int fence_fd)
 		if (i == stat_nids && stat_nids < NELEM(stat_ids))
 			stat_ids[stat_nids++] = b->id;
 
-		if (opt_trace) {
+		if (opt_trace && dt > TRACE_LATE_MS) {
 			if (trace_left > 0) {
-				fprintf(stderr, "bhyve-viewer: trace seq=%ju "
-				    "buf=%u fence=%s dt=%.2fms\n",
+				fprintf(stderr, "bhyve-viewer: late seq=%ju "
+				    "buf=%u fence=%s draw_dt=%.2fms "
+				    "arrive_dt=%.2fms\n",
 				    (uintmax_t)draw_seq, b->id,
-				    fence_fd >= 0 ? "yes" : "NO", dt);
+				    fence_fd >= 0 ? "yes" : "NO", dt,
+				    stat_last_arrival_dt);
 				if (--trace_left == 0)
 					fprintf(stderr, "bhyve-viewer: trace "
 					    "budget spent, further frames not "
@@ -790,6 +804,19 @@ handle_frame(struct view *v, const struct gpu_display_frame *f, int fence_fd)
 	 * fence matters -- a superseded frame's fence guards a buffer we are
 	 * no longer going to read.
 	 */
+	{
+		struct timespec now;
+
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (stat_last_arrival.tv_sec != 0) {
+			stat_last_arrival_dt =
+			    (double)(now.tv_sec - stat_last_arrival.tv_sec) * 1e3 +
+			    (double)(now.tv_nsec - stat_last_arrival.tv_nsec) / 1e6;
+			stat_arr_dt[DT_BUCKET(stat_last_arrival_dt)]++;
+		}
+		stat_last_arrival = now;
+	}
+
 	if (v->pending_fence >= 0)
 		close(v->pending_fence);
 	if (v->have_pending)
@@ -829,12 +856,15 @@ stats_tick(void)
 	fprintf(stderr, "bhyve-viewer: %ldms in=%ju drawn=%ju superseded=%ju | "
 	    "fence: ok=%ju none=%ju unusable=%ju | bufs: ids=%u redraw=%ju "
 	    "imports=%ju evict=%ju | dt<8=%ju 8-12=%ju 12-20=%ju 20-33=%ju "
-	    "33-50=%ju >50=%ju\n",
+	    "33-50=%ju >50=%ju | arrive dt<8=%ju 8-12=%ju 12-20=%ju "
+	    "20-33=%ju 33-50=%ju >50=%ju\n",
 	    ms, stat_frames_in, stat_frames_drawn, stat_superseded,
 	    stat_fenced, stat_nofence, stat_fence_failed,
 	    stat_nids, stat_redraw_same, stat_imports, evictions,
 	    stat_dt[0], stat_dt[1], stat_dt[2], stat_dt[3], stat_dt[4],
-	    stat_dt[5]);
+	    stat_dt[5],
+	    stat_arr_dt[0], stat_arr_dt[1], stat_arr_dt[2], stat_arr_dt[3],
+	    stat_arr_dt[4], stat_arr_dt[5]);
 
 	if (stat_nids > 0) {
 		unsigned i;
@@ -850,6 +880,7 @@ stats_tick(void)
 	stat_superseded = stat_nofence = stat_fenced = stat_fence_failed = 0;
 	stat_imports = stat_redraw_same = evictions = 0;
 	memset(stat_dt, 0, sizeof(stat_dt));
+	memset(stat_arr_dt, 0, sizeof(stat_arr_dt));
 	stat_nids = 0;
 	clock_gettime(CLOCK_MONOTONIC, &stat_since);
 }
@@ -1505,8 +1536,8 @@ usage:
 		    "  -1  show only the first buffer (doubling diagnostic)\n"
 		    "  -r  cap the draw rate, in frames per second\n"
 		    "  -H  hide the host cursor (what is left is the guest's)\n"
-		    "  -T  trace the next N drawn frames: buffer, fence, "
-		    "interval\n");
+		    "  -T  log the next N late frames (>25ms): buffer, fence,\n"
+		    "      draw interval and arrival interval\n");
 		return (1);
 	}
 
