@@ -320,26 +320,20 @@ static uint64_t keys_sent, ptrs_sent, rels_sent;
  * costs the guest a timeout rather than correctness.
  */
 static void
-send_release_buf(struct view *v, uint32_t buffer_id)
-{
-	struct gpu_display_release r;
-
-	memset(&r, 0, sizeof(r));
-	r.hdr.type = GPU_DISPLAY_MSG_RELEASE;
-	r.hdr.len = sizeof(r);
-	r.buffer_id = buffer_id;
-	if (send_msg(v, &r, sizeof(r)))
-		rels_sent++;
-}
-
-static void
 send_release(struct view *v)
 {
+	struct gpu_display_release r;
 
 	if (!v->rel_pending)
 		return;
 	v->rel_pending = false;
-	send_release_buf(v, v->rel_buf);
+
+	memset(&r, 0, sizeof(r));
+	r.hdr.type = GPU_DISPLAY_MSG_RELEASE;
+	r.hdr.len = sizeof(r);
+	r.buffer_id = v->rel_buf;
+	if (send_msg(v, &r, sizeof(r)))
+		rels_sent++;
 }
 
 /*
@@ -870,15 +864,14 @@ handle_frame(struct view *v, const struct gpu_display_frame *f, int fence_fd)
 	if (v->have_pending) {
 		stat_superseded++;
 		/*
-		 * Coalesced away without ever being read, so the buffer is
-		 * free this instant -- and saying so is not optional.  bhyve
-		 * holds the guest's next present until every frame it sent has
-		 * come back; releasing only the ones we draw leaves the rest
-		 * outstanding for ever, and a guest presenting faster than we
-		 * draw then has every present held until it times out, which
-		 * looks exactly like no flow control at all.
+		 * Deliberately not released here.  A superseded frame names
+		 * the same buffer we are about to draw from -- the guest is
+		 * presenting into one -- so answering on arrival says the
+		 * memory is free while we are still going to read it, and the
+		 * guest was measured racing to 437 presents a second against
+		 * 60 draws on exactly that.  The release belongs after the
+		 * read, once per drawn frame, and nowhere else.
 		 */
-		send_release_buf(v, v->pending_buf);
 	}
 	v->pending_buf = f->buffer_id;
 	v->pending_fence = fence_fd;
