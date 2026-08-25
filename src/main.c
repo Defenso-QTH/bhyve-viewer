@@ -215,6 +215,17 @@ struct view {
 	 */
 	bool		frame_ready;
 	struct wl_callback *frame_cb;
+	/*
+	 * The buffer we last drew from, held until the compositor confirms it
+	 * has taken the frame -- only then is our read of the guest's buffer
+	 * certainly finished, and only then may the guest draw into it again.
+	 *
+	 * Telling bhyve so is what stops a guest presenting into a single
+	 * buffer from overwriting it mid-read, which is what made a fast
+	 * renderer show two frames at once.
+	 */
+	uint32_t	rel_buf;
+	bool		rel_pending;
 	struct timespec	last_cb;	/* when a frame callback last arrived */
 	bool		had_cb;		/* ... and whether one ever has */
 
@@ -301,7 +312,29 @@ send_msg(struct view *v, const void *msg, size_t len)
 	return (write(v->sock, msg, len) == (ssize_t)len);
 }
 
-static uint64_t keys_sent, ptrs_sent;
+static uint64_t keys_sent, ptrs_sent, rels_sent;
+
+/*
+ * Tell bhyve the buffer we drew from is free.  Sent once per drawn frame;
+ * bhyve holds the guest's next present until it arrives, so dropping one
+ * costs the guest a timeout rather than correctness.
+ */
+static void
+send_release(struct view *v)
+{
+	struct gpu_display_release r;
+
+	if (!v->rel_pending)
+		return;
+	v->rel_pending = false;
+
+	memset(&r, 0, sizeof(r));
+	r.hdr.type = GPU_DISPLAY_MSG_RELEASE;
+	r.hdr.len = sizeof(r);
+	r.buffer_id = v->rel_buf;
+	if (send_msg(v, &r, sizeof(r)))
+		rels_sent++;
+}
 
 /*
  * Which evdev keys we have told the guest are down.
@@ -489,6 +522,7 @@ frame_done(void *data, struct wl_callback *cb,
 	v->frame_ready = true;
 	clock_gettime(CLOCK_MONOTONIC, &v->last_cb);
 	v->had_cb = true;
+	send_release(v);
 }
 
 /*
@@ -634,6 +668,14 @@ draw(struct view *v, struct buf *b, int fence_fd)
 	clock_gettime(CLOCK_MONOTONIC, &v->last_draw);
 
 	eglSwapBuffers(v->egl_dpy, v->egl_surf);
+
+	/*
+	 * Armed, not sent: the commit is queued, not yet taken.  The frame
+	 * callback is the compositor saying it has the frame, and that is the
+	 * first moment our sampling of the guest's buffer is certainly over.
+	 */
+	v->rel_buf = b->id;
+	v->rel_pending = true;
 }
 
 /* ------------------------------------------------------------------ */
@@ -853,12 +895,14 @@ stats_tick(void)
 	 * is a handful of frames out of sixty, and dividing that by the
 	 * interval rounds it away.
 	 */
-	fprintf(stderr, "bhyve-viewer: %ldms in=%ju drawn=%ju superseded=%ju | "
+	fprintf(stderr, "bhyve-viewer: %ldms in=%ju drawn=%ju superseded=%ju "
+	    "released=%ju | "
 	    "fence: ok=%ju none=%ju unusable=%ju | bufs: ids=%u redraw=%ju "
 	    "imports=%ju evict=%ju | dt<8=%ju 8-12=%ju 12-20=%ju 20-33=%ju "
 	    "33-50=%ju >50=%ju | arrive dt<8=%ju 8-12=%ju 12-20=%ju "
 	    "20-33=%ju 33-50=%ju >50=%ju\n",
 	    ms, stat_frames_in, stat_frames_drawn, stat_superseded,
+	    (uintmax_t)rels_sent,
 	    stat_fenced, stat_nofence, stat_fence_failed,
 	    stat_nids, stat_redraw_same, stat_imports, evictions,
 	    stat_dt[0], stat_dt[1], stat_dt[2], stat_dt[3], stat_dt[4],
