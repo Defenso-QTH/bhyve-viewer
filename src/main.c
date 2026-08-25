@@ -226,6 +226,16 @@ struct view {
 	 */
 	uint32_t	rel_buf;
 	bool		rel_pending;
+	/*
+	 * Signalled when our read of the guest's buffer has actually finished
+	 * on the GPU.  That is the moment the buffer is free, and it is the
+	 * only sound thing to key the release off: keying it off the
+	 * compositor's frame callback meant that when callbacks stopped
+	 * arriving -- which they do -- the viewer fell back to its timer,
+	 * kept drawing, and never released anything.  bhyve was left holding
+	 * every present, and the picture froze for seconds.
+	 */
+	EGLSyncKHR	draw_sync;
 	struct timespec	last_cb;	/* when a frame callback last arrived */
 	bool		had_cb;		/* ... and whether one ever has */
 
@@ -295,6 +305,7 @@ static void	handle_cursor(struct view *v,
 		    const struct gpu_display_cursor *c, size_t len);
 
 static PFNEGLCREATESYNCKHRPROC		p_eglCreateSyncKHR;
+static PFNEGLCLIENTWAITSYNCKHRPROC	p_eglClientWaitSyncKHR;
 static PFNEGLDESTROYSYNCKHRPROC		p_eglDestroySyncKHR;
 static PFNEGLWAITSYNCKHRPROC		p_eglWaitSyncKHR;
 static PFNEGLCREATEIMAGEKHRPROC		p_eglCreateImageKHR;
@@ -522,7 +533,6 @@ frame_done(void *data, struct wl_callback *cb,
 	v->frame_ready = true;
 	clock_gettime(CLOCK_MONOTONIC, &v->last_cb);
 	v->had_cb = true;
-	send_release(v);
 }
 
 /*
@@ -674,8 +684,43 @@ draw(struct view *v, struct buf *b, int fence_fd)
 	 * callback is the compositor saying it has the frame, and that is the
 	 * first moment our sampling of the guest's buffer is certainly over.
 	 */
+	/*
+	 * A fence still outstanding means the previous frame was never
+	 * released -- release it now rather than leaking the sync and leaving
+	 * bhyve holding a present for ever.
+	 */
+	if (v->draw_sync != EGL_NO_SYNC_KHR) {
+		p_eglDestroySyncKHR(v->egl_dpy, v->draw_sync);
+		v->draw_sync = EGL_NO_SYNC_KHR;
+		send_release(v);
+	}
 	v->rel_buf = b->id;
 	v->rel_pending = true;
+	if (p_eglCreateSyncKHR != NULL && p_eglClientWaitSyncKHR != NULL)
+		v->draw_sync = p_eglCreateSyncKHR(v->egl_dpy,
+		    EGL_SYNC_FENCE_KHR, NULL);
+	if (v->draw_sync == EGL_NO_SYNC_KHR)
+		send_release(v);	/* no fence available: say so now */
+}
+
+/*
+ * Release the buffer once the GPU has finished reading it.  Polled from the
+ * main loop rather than waited on, so a fence that never signals costs
+ * nothing but a release.
+ */
+static void
+check_draw_sync(struct view *v)
+{
+	EGLint r;
+
+	if (!v->rel_pending || v->draw_sync == EGL_NO_SYNC_KHR)
+		return;
+	r = p_eglClientWaitSyncKHR(v->egl_dpy, v->draw_sync, 0, 0);
+	if (r == EGL_TIMEOUT_EXPIRED_KHR)
+		return;
+	p_eglDestroySyncKHR(v->egl_dpy, v->draw_sync);
+	v->draw_sync = EGL_NO_SYNC_KHR;
+	send_release(v);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1476,6 +1521,8 @@ egl_setup(struct view *v)
 	p_eglCreateSyncKHR = (void *)eglGetProcAddress("eglCreateSyncKHR");
 	p_eglDestroySyncKHR = (void *)eglGetProcAddress("eglDestroySyncKHR");
 	p_eglWaitSyncKHR = (void *)eglGetProcAddress("eglWaitSyncKHR");
+	p_eglClientWaitSyncKHR =
+	    (void *)eglGetProcAddress("eglClientWaitSyncKHR");
 	if (p_eglCreateSyncKHR == NULL || p_eglWaitSyncKHR == NULL)
 		fprintf(stderr, "bhyve-viewer: no EGL_ANDROID_native_fence_sync;"
 		    " frames will not be synchronised with the guest\n");
@@ -1690,6 +1737,13 @@ usage:
 		    FRAME_CB_TIMEOUT_MS) : -1;
 		if (v.have_pending && opt_min_frame_ms > 0)
 			timeout = 5;	/* re-check the rate cap promptly */
+		/*
+		 * A fence is outstanding and nothing else may wake us: bhyve
+		 * is holding the guest until it is released, so an infinite
+		 * timeout here would stall the guest rather than this process.
+		 */
+		if (v.rel_pending && (timeout < 0 || timeout > 2))
+			timeout = 2;
 
 		if (poll(pfd, 2, timeout) < 0) {
 			wl_display_cancel_read(v.dpy);
@@ -1702,6 +1756,8 @@ usage:
 			wl_display_read_events(v.dpy);
 		else
 			wl_display_cancel_read(v.dpy);
+		check_draw_sync(&v);
+
 		if (wl_display_dispatch_pending(v.dpy) < 0)
 			break;
 
