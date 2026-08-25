@@ -320,20 +320,26 @@ static uint64_t keys_sent, ptrs_sent, rels_sent;
  * costs the guest a timeout rather than correctness.
  */
 static void
-send_release(struct view *v)
+send_release_buf(struct view *v, uint32_t buffer_id)
 {
 	struct gpu_display_release r;
-
-	if (!v->rel_pending)
-		return;
-	v->rel_pending = false;
 
 	memset(&r, 0, sizeof(r));
 	r.hdr.type = GPU_DISPLAY_MSG_RELEASE;
 	r.hdr.len = sizeof(r);
-	r.buffer_id = v->rel_buf;
+	r.buffer_id = buffer_id;
 	if (send_msg(v, &r, sizeof(r)))
 		rels_sent++;
+}
+
+static void
+send_release(struct view *v)
+{
+
+	if (!v->rel_pending)
+		return;
+	v->rel_pending = false;
+	send_release_buf(v, v->rel_buf);
 }
 
 /*
@@ -861,8 +867,19 @@ handle_frame(struct view *v, const struct gpu_display_frame *f, int fence_fd)
 
 	if (v->pending_fence >= 0)
 		close(v->pending_fence);
-	if (v->have_pending)
+	if (v->have_pending) {
 		stat_superseded++;
+		/*
+		 * Coalesced away without ever being read, so the buffer is
+		 * free this instant -- and saying so is not optional.  bhyve
+		 * holds the guest's next present until every frame it sent has
+		 * come back; releasing only the ones we draw leaves the rest
+		 * outstanding for ever, and a guest presenting faster than we
+		 * draw then has every present held until it times out, which
+		 * looks exactly like no flow control at all.
+		 */
+		send_release_buf(v, v->pending_buf);
+	}
 	v->pending_buf = f->buffer_id;
 	v->pending_fence = fence_fd;
 	v->have_pending = true;
